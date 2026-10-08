@@ -239,8 +239,6 @@ def extraer_lecturas_pdf_integrado(pdf_source) -> list:
 
 st.set_page_config(page_title="Dosimetría - Control de Acceso", layout="wide")
 
-def get_conexion():
-    return sqlite3.connect('C:/Users/ACPRO-PC/Desktop/dosimetria ICS/dosimetria.db')
 
 conn = get_conexion()
 
