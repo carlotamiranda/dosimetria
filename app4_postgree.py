@@ -252,33 +252,7 @@ conn = get_conexion()
 # ==========================================
 cursor = conn.cursor()
 
-'''
-# 2. Tabla intermedia de asignaciones
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS asignaciones_dosimetros (
-        id_asignacion INTEGER PRIMARY KEY AUTOINCREMENT,
-        id_trabajador INTEGER NOT NULL,
-        id_dosimetro INTEGER NOT NULL,
-        fecha_asignacion TEXT DEFAULT (datetime('now', 'localtime')),
-        activo INTEGER DEFAULT 1,
-        FOREIGN KEY(id_trabajador) REFERENCES trabajadores(id_trabajador),
-        FOREIGN KEY(id_dosimetro) REFERENCES dosimetros(id_dosimetro)
-    );
-""")
 
-# 3. Asegurar columnas de fechas en trabajadores
-try:
-    cursor.execute("ALTER TABLE trabajadores ADD COLUMN fecha_alta TEXT;")
-except Exception:
-    pass
-
-try:
-    cursor.execute("ALTER TABLE trabajadores ADD COLUMN fecha_baja TEXT;")
-except Exception:
-    pass
-
-conn.commit()
-'''
 # ==========================================
 # GESTIÓN DE SESIÓN Y LOGIN
 # ==========================================
