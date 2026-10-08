@@ -8,19 +8,28 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import sqlite3
+import psycopg2
+import os
 
-# Reemplaza la línea que da error por esta comprobación segura
+# ==============================================================================
+# CONEXIÓN A BASE DE DATOS (NUBE / LOCAL)
+# ==============================================================================
+DATABASE_URL = None
+
 try:
-    DATABASE_URL = os.environ.get("DATABASE_URL") or st.secrets.get("DATABASE_URL")
+    # Intenta leer de los Secrets de Streamlit o del entorno
+    if "DATABASE_URL" in st.secrets:
+        DATABASE_URL = st.secrets["DATABASE_URL"]
+    else:
+        DATABASE_URL = os.environ.get("DATABASE_URL")
 except Exception:
     DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if DATABASE_URL:
-    import psycopg2
-    # Si la URL viene de Heroku/Render con postgres://, psycopg2 prefiere postgresql://
+    # Ajustar prefijo para compatibilidad con psycopg2 si fuera necesario
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    
+        
     conn = psycopg2.connect(DATABASE_URL)
     DB_ENGINE = "postgresql"
 else:
