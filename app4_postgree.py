@@ -9,8 +9,11 @@ import pandas as pd
 import streamlit as st
 import sqlite3
 
-# Intentar usar PostgreSQL si existe la variable de entorno, de lo contrario usar SQLite local
-DATABASE_URL = os.environ.get("DATABASE_URL") or st.secrets.get("DATABASE_URL", None)
+# Reemplaza la línea que da error por esta comprobación segura
+try:
+    DATABASE_URL = os.environ.get("DATABASE_URL") or st.secrets.get("DATABASE_URL")
+except Exception:
+    DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if DATABASE_URL:
     import psycopg2
