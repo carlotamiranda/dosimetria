@@ -14,8 +14,11 @@ import psycopg2
 # CONEXIÓN A BASE DE DATOS (EXCLUSIVA POSTGRESQL / NEON)
 # ==============================================================================
 @st.cache_resource
+# ==============================================================================
+# CONEXIÓN A BASE DE DATOS (POSTGRESQL CON RECONEXIÓN AUTOMÁTICA)
+# ==============================================================================
 def get_conexion():
-    """Establece y mantiene la conexión con la base de datos PostgreSQL en Neon."""
+    """Obtiene o restablece la conexión con PostgreSQL si se ha caído."""
     db_url = None
     try:
         if "DATABASE_URL" in st.secrets:
@@ -25,17 +28,19 @@ def get_conexion():
     except Exception:
         db_url = os.environ.get("DATABASE_URL")
 
-    # Si estamos en local y no hay secretos/variables de entorno, usar la cadena de Neon directamente
     if not db_url:
         db_url = "postgresql://neondb_owner:npg_cauNdBv9MO8L@ep-wandering-bread-b214whi7-pooler.c-6.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
-    if db_url and db_url.startswith("postgres://"):
+    if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-    return psycopg2.connect(db_url)
+    # Recomprobar si la conexión global existe y está abierta
+    if 'conn' not in st.session_state or st.session_state['conn'].closed != 0:
+        st.session_state['conn'] = psycopg2.connect(db_url)
+        
+    return st.session_state['conn']
 
 conn = get_conexion()
-
 
 # ==============================================================================
 # 2. FUNCIONES AUXILIARES Y CÁLCULOS DOSIMÉTRICOS
@@ -196,13 +201,17 @@ def login():
             
             if btn_login:
                 try:
-                    cursor = conn.cursor()
+                    # Garantizar conexión activa
+                    conexion = get_conexion()
+                    cursor = conexion.cursor()
+                    
                     cursor.execute(
                         "SELECT username, rol, id_area_sanitaria, id_centro FROM usuarios WHERE username = %s AND password = %s", 
                         (username, password)
                     )
                     user = cursor.fetchone()
                     cursor.close()
+                    
                     if user:
                         st.session_state['usuario_logueado'] = user[0]
                         st.session_state['rol'] = user[1]
@@ -213,9 +222,14 @@ def login():
                     else:
                         st.error("Usuario o contraseña incorrectos.")
                 except Exception as e:
-                    conn.rollback()
-                    st.error(f"Error en el inicio de sesión: {e}")
-
+                    # Si falla por desconexión, forzar reinicio de conexión limpiamente
+                    if 'conn' in st.session_state:
+                        try:
+                            st.session_state['conn'].close()
+                        except Exception:
+                            pass
+                        del st.session_state['conn']
+                    st.error("Se ha perdido la conexión momentáneamente con el servidor. Por favor, pulsa 'Iniciar Sesión' de nuevo.")
 def logout():
     st.session_state['usuario_logueado'] = None
     st.session_state['rol'] = None
