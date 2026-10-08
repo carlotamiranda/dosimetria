@@ -14,10 +14,9 @@ import os
 # ==============================================================================
 # CONEXIÓN A BASE DE DATOS (NUBE / LOCAL)
 # ==============================================================================
+# 1. Configuración de la conexión
 DATABASE_URL = None
-
 try:
-    # Intenta leer de los Secrets de Streamlit o del entorno
     if "DATABASE_URL" in st.secrets:
         DATABASE_URL = st.secrets["DATABASE_URL"]
     else:
@@ -26,17 +25,66 @@ except Exception:
     DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if DATABASE_URL:
-    # Ajustar prefijo para compatibilidad con psycopg2 si fuera necesario
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        
-    conn = psycopg2.connect(DATABASE_URL)
+    
+    _conn_raw = psycopg2.connect(DATABASE_URL)
     DB_ENGINE = "postgresql"
 else:
-    conn = sqlite3.connect("dosimetria.db", check_same_thread=False)
+    _conn_raw = sqlite3.connect("dosimetria.db", check_same_thread=False)
     DB_ENGINE = "sqlite"
 
+# 2. Clase adaptadora para corregir las consultas de forma transparente
+class SmartCursorWrapper:
+    def __init__(self, cursor, is_postgres):
+        self.cursor = cursor
+        self.is_postgres = is_postgres
 
+    def execute(self, query, params=None):
+        if self.is_postgres and isinstance(query, str):
+            # Convierte la sintaxis de SQLite (?) a la de PostgreSQL (%s)
+            query = query.replace("?", "%s")
+        if params is not None:
+            return self.cursor.execute(query, params)
+        return self.cursor.execute(query)
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+    def close(self):
+        return self.cursor.close()
+
+    def __getattr__(self, name):
+        return getattr(self.cursor, name)
+
+class SmartConnectionWrapper:
+    def __init__(self, conn, is_postgres):
+        self.conn = conn
+        self.is_postgres = is_postgres
+
+    def cursor(self):
+        return SmartCursorWrapper(self.conn.cursor(), self.is_postgres)
+
+    def commit(self):
+        return self.conn.commit()
+
+    def rollback(self):
+        return self.conn.rollback()
+
+    def close(self):
+        return self.conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self.conn, name)
+
+# 3. Reemplazamos la conexión global por el adaptador inteligente
+conn = SmartConnectionWrapper(_conn_raw, DB_ENGINE == "postgresql")
+
+def get_conexion():
+    return conn
 
 
 
