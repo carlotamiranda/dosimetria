@@ -98,22 +98,22 @@ def get_conexion():
 # CONEXIÓN A LA BASE DE DATOS (POSTGRESQL CON FALLBACK A SQLITE)
 # ==============================================================================
 
-def get_conexion():
+#def get_conexion():
     # Si existe una URL de PostgreSQL en secrets o entorno, conectar a Neon
-    db_url = os.environ.get("DATABASE_URL")
-    try:
-        if not db_url and "DATABASE_URL" in st.secrets:
-            db_url = st.secrets["DATABASE_URL"]
-    except Exception:
-        pass
+    #db_url = os.environ.get("DATABASE_URL")
+    #try:
+     #   if not db_url and "DATABASE_URL" in st.secrets:
+      #      db_url = st.secrets["DATABASE_URL"]
+    #except Exception:
+     #   pass
 
-    if db_url:
-        if db_url.startswith("postgres://"):
-            db_url = db_url.replace("postgres://", "postgresql://", 1)
-        return psycopg2.connect(db_url)
-    else:
+    #if db_url:
+     #   if db_url.startswith("postgres://"):
+     #       db_url = db_url.replace("postgres://", "postgresql://", 1)
+     #   return psycopg2.connect(db_url)
+   # else:
         # En local o respaldo, usar una ruta relativa simple, no una ruta absoluta de Windows
-        return sqlite3.connect("dosimetria.db", check_same_thread=False)
+    #   return sqlite3.connect("dosimetria.db", check_same_thread=False)
 
 
 
