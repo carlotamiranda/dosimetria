@@ -41,12 +41,14 @@ class SmartCursorWrapper:
         self.is_postgres = is_postgres
 
     def execute(self, query, params=None):
-        if self.is_postgres and isinstance(query, str):
-            # Convierte la sintaxis de SQLite (?) a la de PostgreSQL (%s)
-            query = query.replace("?", "%s")
+        sql_query = str(query)
+        if self.is_postgres:
+            # Reemplazar todos los marcadores '?' por '%s'
+            sql_query = sql_query.replace("?", "%s")
+            
         if params is not None:
-            return self.cursor.execute(query, params)
-        return self.cursor.execute(query)
+            return self.cursor.execute(sql_query, params)
+        return self.cursor.execute(sql_query)
 
     def fetchone(self):
         return self.cursor.fetchone()
@@ -59,7 +61,7 @@ class SmartCursorWrapper:
 
     def __getattr__(self, name):
         return getattr(self.cursor, name)
-
+    
 class SmartConnectionWrapper:
     def __init__(self, conn, is_postgres):
         self.conn = conn
