@@ -252,18 +252,7 @@ conn = get_conexion()
 # ==========================================
 cursor = conn.cursor()
 
-# 1. Tabla de registros de horas
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS registros_horas (
-        id_registro INTEGER PRIMARY KEY AUTOINCREMENT,
-        id_trabajador INTEGER,
-        mes_anio TEXT,
-        horas REAL,
-        dosis_total REAL,
-        FOREIGN KEY(id_trabajador) REFERENCES trabajadores(id_trabajador)
-    );
-""")
-
+'''
 # 2. Tabla intermedia de asignaciones
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS asignaciones_dosimetros (
@@ -289,7 +278,7 @@ except Exception:
     pass
 
 conn.commit()
-
+'''
 # ==========================================
 # GESTIÓN DE SESIÓN Y LOGIN
 # ==========================================
