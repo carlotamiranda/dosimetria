@@ -8,51 +8,65 @@ import pdfplumber
 import numpy as np
 import pandas as pd
 import streamlit as st
-import psycopg2
+import sqlite3
+
+try:
+    import psycopg2
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
 
 # ==============================================================================
-# CONEXIÓN A BASE DE DATOS (EXCLUSIVA POSTGRESQL / NEON)
+# 2. FUNCIONES DE BASE DE DATOS Y CÁLCULOS DOSIMÉTRICOS
 # ==============================================================================
-@st.cache_resource
-# ==============================================================================
-# CONEXIÓN A BASE DE DATOS (POSTGRESQL CON RECONEXIÓN AUTOMÁTICA)
-# ==============================================================================
-def get_conexion():
-    """Obtiene o restablece la conexión con PostgreSQL si se ha caído."""
-    db_url = None
-    try:
-        if "DATABASE_URL" in st.secrets:
-            db_url = st.secrets["DATABASE_URL"]
-        else:
-            db_url = os.environ.get("DATABASE_URL")
-    except Exception:
-        db_url = os.environ.get("DATABASE_URL")
 
+def get_db_connection():
+    """
+    Conecta a PostgreSQL si existe la variable DATABASE_URL.
+    Si estamos en local sin secrets.toml, usa la BD SQLite local sin lanzar errores.
+    """
+    db_url = os.getenv("DATABASE_URL")
+    
     if not db_url:
-        db_url = "postgresql://neondb_owner:npg_cauNdBv9MO8L@ep-wandering-bread-b214whi7-pooler.c-6.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+        try:
+            db_url = st.secrets.get("DATABASE_URL", None)
+        except Exception:
+            db_url = None
 
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    if db_url and HAS_PSYCOPG2:
+        try:
+            conn = psycopg2.connect(db_url, connect_timeout=10)
+            return conn, "postgresql"
+        except Exception:
+            pass
 
-    # Recomprobar si la conexión global existe y está abierta
-    if 'conn' not in st.session_state or st.session_state['conn'].closed != 0:
-        st.session_state['conn'] = psycopg2.connect(db_url)
+    ruta_sqlite = 'C:/Users/ACPRO-PC/Desktop/dosimetria ICS/dosimetria.db'
+    if not os.path.exists(ruta_sqlite):
+        ruta_sqlite = 'dosimetria.db'
         
-    return st.session_state['conn']
+    conn = sqlite3.connect(ruta_sqlite)
+    return conn, "sqlite"
 
-conn = get_conexion()
 
-# ==============================================================================
-# 2. FUNCIONES AUXILIARES Y CÁLCULOS DOSIMÉTRICOS
-# ==============================================================================
+def query_db(conn, engine, query, params=()):
+    """ Adapta los marcadores de posición según el motor (SQLite ? vs PostgreSQL %s) """
+    q = query
+    if engine == "postgresql":
+        q = q.replace("?", "%s")
+    cursor = conn.cursor()
+    cursor.execute(q, params)
+    return cursor
+
+
+def read_sql_db(query, conn, engine, params=None):
+    """ Adapta pd.read_sql para ambos motores """
+    q = query
+    if engine == "postgresql":
+        q = q.replace("?", "%s")
+    return pd.read_sql(q, conn, params=params)
+
 
 def calcular_dosis_trabajador(lista_dosis):
-    """
-    Aplica la norma de asignación según el número de áreas (N):
-    - FONDO / M / <0.10 -> 0.00 mSv
-    - N = 1 -> Dosis directa
-    - N > 1 -> Media + 2 * Desviación Típica Muestral (ddof=1)
-    """
     if not lista_dosis or len(lista_dosis) == 0:
         return 0.00
 
@@ -83,12 +97,10 @@ def calcular_dosis_trabajador(lista_dosis):
 
     media = np.mean(dosis_array)
     desviacion = np.std(dosis_array, ddof=1)
-    
     return round(float(media + (2 * desviacion)), 2)
 
 
 def calcular_dosis_asignada_pdf(valor_texto: str) -> float:
-    """ Convierte texto de dosis del PDF ('FONDO', 'M', '<0.10', etc.) a flotante """
     if not valor_texto:
         return 0.0
     valor_limpio = str(valor_texto).strip().upper()
@@ -101,7 +113,6 @@ def calcular_dosis_asignada_pdf(valor_texto: str) -> float:
 
 
 def extraer_lecturas_pdf_integrado(pdf_source) -> list:
-    """ Extrae las lecturas mensuales del PDF del CND. """
     registros = []
     patron_instalacion = re.compile(r"\b([0-9]{2}[A-Z][0-9A-Z])\b")
     patron_periodo = re.compile(
@@ -111,7 +122,7 @@ def extraer_lecturas_pdf_integrado(pdf_source) -> list:
 
     with pdfplumber.open(pdf_source) as pdf:
         num_instalacion = None
-        periodo_detectado = "Anual 2025"
+        periodo_detectado = "Anual 2026"
         mes_detectado = "Enero"
         anio_detectado = 2026
 
@@ -134,6 +145,7 @@ def extraer_lecturas_pdf_integrado(pdf_source) -> list:
                     mes_detectado = match_mes.group(1).capitalize()
 
         seccion_actual = "Personal"
+
         for pagina in pdf.pages:
             texto_p = pagina.extract_text() or ""
             for linea in texto_p.split("\n"):
@@ -179,82 +191,160 @@ def extraer_lecturas_pdf_integrado(pdf_source) -> list:
 
 
 # ==============================================================================
-# 3. CONFIGURACIÓN DE STREAMLIT Y SESIÓN
+# 3. CONFIGURACIÓN DE STREAMLIT Y CONEXIÓN
 # ==============================================================================
-st.set_page_config(page_title="Dosimetría - Control de Acceso", layout="wide")
+st.set_page_config(
+    page_title="Gestión de Dosimetría",
+    page_icon="📋",
+    layout="wide"
+)
 
+conn, DB_ENGINE = get_db_connection()
+
+# ==========================================
+# GESTIÓN DE SESIÓN Y LOGIN
+# ==========================================
 if 'usuario_logueado' not in st.session_state:
     st.session_state['usuario_logueado'] = None
     st.session_state['rol'] = None
     st.session_state['id_area'] = None
+    st.session_state['nombre_area'] = None
     st.session_state['id_centro'] = None
 
-
 def login():
-    st.title("Control de Acceso - Gestión de dosimetría")
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
+        st.markdown("### Control de Acceso")
         with st.form("form_login"):
             username = st.text_input("Usuario")
             password = st.text_input("Contraseña", type="password")
             btn_login = st.form_submit_button("Iniciar Sesión", use_container_width=True)
             
             if btn_login:
-                try:
-                    # Garantizar conexión activa
-                    conexion = get_conexion()
-                    cursor = conexion.cursor()
-                    
-                    cursor.execute(
-                        "SELECT username, rol, id_area_sanitaria, id_centro FROM usuarios WHERE username = %s AND password = %s", 
-                        (username, password)
-                    )
-                    user = cursor.fetchone()
-                    cursor.close()
-                    
-                    if user:
-                        st.session_state['usuario_logueado'] = user[0]
-                        st.session_state['rol'] = user[1]
-                        st.session_state['id_area'] = user[2]
-                        st.session_state['id_centro'] = user[3]
-                        st.success(f"Bienvenido/a, {user[0]}")
-                        st.rerun()
-                    else:
-                        st.error("Usuario o contraseña incorrectos.")
-                except Exception as e:
-                    # Si falla por desconexión, forzar reinicio de conexión limpiamente
-                    if 'conn' in st.session_state:
-                        try:
-                            st.session_state['conn'].close()
-                        except Exception:
-                            pass
-                        del st.session_state['conn']
-                    st.error("Se ha perdido la conexión momentáneamente con el servidor. Por favor, pulsa 'Iniciar Sesión' de nuevo.")
+                query_login = """
+                    SELECT u.username, u.rol, u.id_area_sanitaria, u.id_centro, a.nombre 
+                    FROM usuarios u
+                    LEFT JOIN areas_sanitarias a ON u.id_area_sanitaria = a.id_area
+                    WHERE u.username = ? AND u.password = ?
+                """
+                cursor = query_db(conn, DB_ENGINE, query_login, (username, password))
+                user = cursor.fetchone()
+                
+                if user:
+                    st.session_state['usuario_logueado'] = user[0]
+                    st.session_state['rol'] = user[1]
+                    st.session_state['id_area'] = user[2]
+                    st.session_state['id_centro'] = user[3]
+                    st.session_state['nombre_area'] = user[4] if user[4] else "Todas / No asignada"
+                    st.success(f"Bienvenido/a, {user[0]}")
+                    st.rerun()
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+
 def logout():
-    st.session_state['usuario_logueado'] = None
-    st.session_state['rol'] = None
-    st.session_state['id_area'] = None
-    st.session_state['id_centro'] = None
+    for key in ['usuario_logueado', 'rol', 'id_area', 'nombre_area', 'id_centro']:
+        st.session_state[key] = None
     st.rerun()
 
 if st.session_state['usuario_logueado'] is None:
     login()
     st.stop()
 
-
 # ==========================================
-# CABECERA DE USUARIO LOGUEADO
+# ESTILO CSS (ENCABEZADO HOLGADO Y PESTAÑAS AZULES)
 # ==========================================
-col_titulo, col_user = st.columns([4, 1])
-with col_titulo:
-    st.title("Gestión Integral - Dosimetría de Área")
-with col_user:
-    st.write(f"👤 **{st.session_state['usuario_logueado']}**")
-    st.caption(f"Rol: {st.session_state['rol']}")
-    if st.button("Cerrar Sesión"):
-        logout()
+st.markdown("""
+    <style>
+        .block-container {
+            padding-top: 2.2rem !important;
+            padding-bottom: 1.5rem !important;
+        }
+        .header-card {
+            background-color: #ffffff;
+            border: 1px solid #cbd5e1;
+            border-left: 6px solid #1E3A8A;
+            border-radius: 8px;
+            padding: 12px 18px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .header-title {
+            color: #1E3A8A;
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin: 0;
+            padding: 0;
+        }
+        .header-sub {
+            color: #64748B;
+            font-size: 0.88rem;
+            margin-top: 2px;
+        }
+        .user-info-text {
+            font-size: 0.9rem;
+            color: #1e293b;
+            line-height: 1.45;
+        }
+        
+        /* Neutralizar estilos rojos nativos en pestañas */
+        button[data-baseweb="tab"] {
+            color: #475569 !important;
+        }
+        button[data-baseweb="tab"] p {
+            color: #475569 !important;
+            font-size: 0.95rem !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] {
+            color: #1E3A8A !important;
+            border-bottom-color: #1E3A8A !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] p {
+            color: #1E3A8A !important;
+            font-weight: 700 !important;
+        }
+        div[data-baseweb="tab-highlight"] {
+            background-color: #1E3A8A !important;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-st.divider()
+def mostrar_encabezado():
+    usuario = st.session_state.get('usuario_logueado', 'Usuario')
+    rol = st.session_state.get('rol', 'Sin Rol')
+    area = st.session_state.get('nombre_area', 'Todas / No asignada')
+    
+    col_tit, col_info = st.columns([2, 3])
+    
+    with col_tit:
+        st.markdown(
+            """
+            <div>
+                <div class="header-title">Gestión de Dosimetría</div>
+                <div class="header-sub">Sistema de Control y Seguimiento Dosimétrico</div>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+        
+    with col_info:
+        col_txt, col_btn = st.columns([3, 1])
+        with col_txt:
+            st.markdown(
+                f"""
+                <div class="header-card">
+                    <div class="user-info-text">
+                        <b>📍 Área Sanitaria:</b> {area}<br>
+                        <b>👤 Usuario:</b> {usuario} <span style="color: #64748B;">({rol})</span>
+                    </div>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
+        with col_btn:
+            st.write("")
+            if st.button("🚪 Salir", key="btn_logout_top", use_container_width=True):
+                logout()
+
+mostrar_encabezado()
 
 # ==========================================
 # CONSULTA BASE DE CENTROS SEGÚN ROL
@@ -272,25 +362,25 @@ try:
             FROM centros c
             LEFT JOIN areas_sanitarias a ON c.id_area_sanitaria = a.id_area
         """
-        df_centros = pd.read_sql(query_centros, conn)
+        df_centros = read_sql_db(query_centros, conn, DB_ENGINE)
 
     elif rol == 'Coordinador':
         query_centros = """
             SELECT c.id_centro, c.nombre as centro, c.n_instalacion_cnd, a.nombre as area_sanitaria, a.id_area
             FROM centros c
             JOIN areas_sanitarias a ON c.id_area_sanitaria = a.id_area
-            WHERE a.id_area = %s
+            WHERE a.id_area = ?
         """
-        df_centros = pd.read_sql(query_centros, conn, params=(id_area_user,))
+        df_centros = read_sql_db(query_centros, conn, DB_ENGINE, params=(id_area_user,))
 
     elif rol == 'Centro':
         query_centros = """
             SELECT c.id_centro, c.nombre as centro, c.n_instalacion_cnd, a.nombre as area_sanitaria, a.id_area
             FROM centros c
             JOIN areas_sanitarias a ON c.id_area_sanitaria = a.id_area
-            WHERE c.id_centro = %s
+            WHERE c.id_centro = ?
         """
-        df_centros = pd.read_sql(query_centros, conn, params=(id_centro_user,))
+        df_centros = read_sql_db(query_centros, conn, DB_ENGINE, params=(id_centro_user,))
         
     else:
         query_centros = """
@@ -298,21 +388,102 @@ try:
             FROM centros c
             LEFT JOIN areas_sanitarias a ON c.id_area_sanitaria = a.id_area
         """
-        df_centros = pd.read_sql(query_centros, conn)
+        df_centros = read_sql_db(query_centros, conn, DB_ENGINE)
 
 except Exception as e:
     st.error(f"Error al cargar los centros: {e}")
     df_centros = pd.DataFrame()
 
+# ==========================================
+# FORMULARIO DE INICIALIZACIÓN (SI ESTÁ VACÍO)
+# ==========================================
+# Si la base de datos está completamente vacía y el usuario es Admin, mostramos un formulario de emergencia
+if df_centros.empty and rol == 'Admin':
+    st.warning("⚠️ La base de datos está vacía. Debes crear la primera Área Sanitaria y el primer Centro.")
+    with st.form("form_inicializacion"):
+        st.subheader("Inicializar Base de Datos")
+        nueva_area = st.text_input("Nombre de la Primera Área Sanitaria (ej: Metropolitana Nord)")
+        nuevo_centro = st.text_input("Nombre del Primer Centro Sanitario")
+        num_cnd = st.text_input("Número de Instalación CND (opcional)")
+        
+        if st.form_submit_button("Crear Datos Iniciales"):
+            if nueva_area and nuevo_centro:
+                try:
+                    if DB_ENGINE == 'sqlite':
+                        cursor = conn.cursor()
+                        cursor.execute("INSERT INTO areas_sanitarias (nombre) VALUES (?)", (nueva_area,))
+                        id_area_nueva = cursor.lastrowid
+                        cursor.execute("INSERT INTO centros (nombre, n_instalacion_cnd, id_area_sanitaria) VALUES (?, ?, ?)", 
+                                       (nuevo_centro, num_cnd, id_area_nueva))
+                        conn.commit()
+                    elif DB_ENGINE == 'postgres':
+                        cursor = conn.cursor()
+                        cursor.execute("INSERT INTO areas_sanitarias (nombre) VALUES (%s) RETURNING id_area;", (nueva_area,))
+                        id_area_nueva = cursor.fetchone()[0]
+                        cursor.execute("INSERT INTO centros (nombre, n_instalacion_cnd, id_area_sanitaria) VALUES (%s, %s, %s);", 
+                                       (nuevo_centro, num_cnd, id_area_nueva))
+                        conn.commit()
+                        cursor.close()
+                    
+                    # 👇 --- LAS LÍNEAS MÁGICAS PARA BORRAR LA MEMORIA --- 👇
+                    st.cache_data.clear()
+                    st.cache_resource.clear()
+                    
+                    st.success("¡Datos inicializados correctamente! Recargando...")
+                    import time
+                    time.sleep(1) # Pequeña pausa para que veas el mensaje verde
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al insertar los datos iniciales: {e}")
+            else:
+                st.error("Debes rellenar al menos el nombre del Área y del Centro.")
+    
+    # Detenemos la ejecución del resto de la página hasta que se inicialice
+    st.stop()
+
 
 # ==========================================
-# DEFINICIÓN DE PESTAÑAS SEGÚN ROL
+# FILTRO GLOBAL DE ÁREA Y CENTRO (ÚNICO Y ARRIBA)
+# ==========================================
+st.markdown("---")
+col_area_filtro, col_centro_filtro = st.columns(2)
+
+with col_area_filtro:
+    if rol == 'Admin':
+        lista_areas = ["Todas"] + sorted(df_centros['area_sanitaria'].dropna().unique().tolist())
+        area_seleccionada = st.selectbox("📍 Área Sanitaria", options=lista_areas, key="global_area_filtro")
+    else:
+        area_usuario = st.session_state.get('nombre_area', 'Área Sanitaria')
+        area_seleccionada = area_usuario
+        st.text_input("📍 Área Sanitaria", value=area_usuario, disabled=True, key="txt_area_fija")
+
+with col_centro_filtro:
+    if area_seleccionada != "Todas" and not df_centros.empty:
+        df_centros_filtrados = df_centros[df_centros['area_sanitaria'] == area_seleccionada]
+    else:
+        df_centros_filtrados = df_centros.copy()
+
+    if not df_centros_filtrados.empty:
+        opciones_centros = sorted(df_centros_filtrados['centro'].dropna().unique().tolist())
+        centro_seleccionado = st.selectbox("🏥 Centro Sanitario", options=opciones_centros, key="global_centro_filtro")
+    else:
+        centro_seleccionado = None
+        st.warning("No hay centros disponibles para esta selección.")
+
+id_centro_activo = None
+if centro_seleccionado and not df_centros.empty:
+    id_centro_activo = int(df_centros.loc[df_centros['centro'] == centro_seleccionado, 'id_centro'].values[0])
+
+st.divider()
+
+# ==========================================
+# DEFINICIÓN DE PESTAÑAS
 # ==========================================
 if rol in ['Admin', 'Coordinador']:
     tab_listado, tab_gestion, tab_centros, tab_lecturas = st.tabs([
         "📋 Listado del Centro", 
         "⚙️ Altas y Bajas", 
-        "🏥 Gestión de Centros", 
+        "🏢 Gestión de Centros", 
         "📄 Lecturas dosimétricas"
     ])
 else:
@@ -322,30 +493,18 @@ else:
         "📄 Lecturas dosimétricas"
     ])
 
-
 # ==============================================================================
 # PESTAÑA 1: LISTADO Y DOSIS ASIGNADA
 # ==============================================================================
 with tab_listado:
     st.header("📋 Personal y Dosimetría de Área")
+    st.info(f"📍 **Centro Activo:** {centro_seleccionado}")
 
-    if not df_centros.empty:
-        lista_centros_p1 = df_centros['centro'].unique()
-
-        if len(lista_centros_p1) == 1:
-            centro_sel_p1 = lista_centros_p1[0]
-            st.info(f"📍 **Centro activo:** {centro_sel_p1}")
-        else:
-            centro_sel_p1 = st.selectbox("Seleccionar Centro:", lista_centros_p1, key="sel_centro_p1")
-
-        id_centro_p1 = int(df_centros.loc[df_centros['centro'] == centro_sel_p1, 'id_centro'].values[0])
-
+    if id_centro_activo:
         try:
-            query_total_dosi = "SELECT COUNT(*) FROM dosimetros WHERE id_centro = %s AND activo = 1"
-            cursor = conn.cursor()
-            cursor.execute(query_total_dosi, (id_centro_p1,))
+            query_total_dosi = "SELECT COUNT(*) FROM dosimetros WHERE id_centro = ? AND activo = 1"
+            cursor = query_db(conn, DB_ENGINE, query_total_dosi, (id_centro_activo,))
             total_dosimetros_centro = cursor.fetchone()[0]
-            cursor.close()
         except Exception:
             total_dosimetros_centro = 0
 
@@ -353,8 +512,8 @@ with tab_listado:
             SELECT 
                 t.id_trabajador AS id_trab,
                 t.nombre AS nombre_trabajador,
-                COALESCE(CAST(t.fecha_alta AS TEXT), 'No asignada') AS fecha_alta,
-                COALESCE(CAST(t.fecha_baja AS TEXT), '-') AS fecha_baja,
+                COALESCE(CAST(t.fecha_alta AS VARCHAR), 'No asignada') AS fecha_alta,
+                COALESCE(CAST(t.fecha_baja AS VARCHAR), '-') AS fecha_baja,
                 d.id_dosimetro,
                 COALESCE(d.codigo_serie || ' (' || COALESCE(d.ubicacion, 'Sin ub.') || ')', 'Sin dosímetro') AS dosimetro_info,
                 COALESCE(SUM(l.hp10_asignada), 0.0) AS hp10_dosi,
@@ -367,17 +526,16 @@ with tab_listado:
             LEFT JOIN lecturas l 
                 ON d.n_usuario_cnd = l.n_usuario_cnd
                AND d.n_instalacion_cnd = l.n_instalacion_cnd
-            WHERE t.id_centro = %s AND t.activo = %s
+            WHERE t.id_centro = ? AND t.activo = ?
             GROUP BY t.id_trabajador, t.nombre, t.fecha_alta, t.fecha_baja, d.id_dosimetro, d.codigo_serie, d.ubicacion
             ORDER BY t.nombre ASC
         """
 
         try:
-            df_raw_activos = pd.read_sql(query_pestaña_1_dosis, conn, params=(id_centro_p1, 1))
+            df_raw_activos = read_sql_db(query_pestaña_1_dosis, conn, DB_ENGINE, params=(id_centro_activo, 1))
 
             if not df_raw_activos.empty:
                 filas_procesadas = []
-
                 for id_trab, group in df_raw_activos.groupby('id_trab'):
                     nombre = group['nombre_trabajador'].iloc[0]
                     fecha_alta = group['fecha_alta'].iloc[0]
@@ -418,14 +576,13 @@ with tab_listado:
                     st.metric("Dosis Máx. Hp(10)", f"{max_dosis} mSv")
 
                 st.divider()
-
                 st.subheader("Personal en Alta y Dosis Asignada")
                 st.dataframe(df_pestaña1_activos, use_container_width=True, hide_index=True)
             else:
                 st.metric("Total Dosímetros del Centro", total_dosimetros_centro)
-                st.info(f"No hay personal activo registrado en {centro_sel_p1}.")
+                st.info(f"No hay personal activo registrado en {centro_seleccionado}.")
 
-            df_raw_bajas = pd.read_sql(query_pestaña_1_dosis, conn, params=(id_centro_p1, 0))
+            df_raw_bajas = read_sql_db(query_pestaña_1_dosis, conn, DB_ENGINE, params=(id_centro_activo, 0))
             if not df_raw_bajas.empty:
                 filas_bajas = []
                 for id_trab, group in df_raw_bajas.groupby('id_trab'):
@@ -439,35 +596,24 @@ with tab_listado:
                         "Dosis Asignada Hp(10) (mSv)": calcular_dosis_trabajador(group['hp10_dosi'].tolist()),
                         "Dosis Asignada Hp(0,07) (mSv)": calcular_dosis_trabajador(group['hp007_dosi'].tolist())
                     })
-                
                 st.write("")
                 with st.expander(f"📋 Ver Personal en Baja / Inactivo ({len(filas_bajas)} registros)"):
                     st.dataframe(pd.DataFrame(filas_bajas), use_container_width=True, hide_index=True)
 
         except Exception as e:
-            st.error(f"Error al cargar la Pestaña 1: {e}")
-    else:
-        st.warning("No hay centros asignados según su rol de usuario.")
+            st.error(f"Error al cargar el listado: {e}")
 
-
-# ==========================================
-# PESTAÑA 2: GESTIÓN (ALTAS, BAJAS Y ASIGNACIÓN)
-# ==========================================
+# ==============================================================================
+# PESTAÑA 2: GESTIÓN (ALTAS, BAJAS Y ASIGNACIONES MÚLTIPLES)
+# ==============================================================================
 with tab_gestion:
-    st.header("⚙️ Gestión de Personal, Dosímetros y Asignaciones Múltiples")
+    st.header("⚙️ Gestión de Personal, Dosímetros y Asignaciones")
+    st.info(f"📍 **Centro Activo:** {centro_seleccionado}")
 
-    if not df_centros.empty:
-        lista_centros_g = df_centros['centro'].unique()
-        
-        if len(lista_centros_g) == 1:
-            centro_sel_g = lista_centros_g[0]
-            st.info(f"📍 **Centro activo:** {centro_sel_g}")
-        else:
-            centro_sel_g = st.selectbox("Seleccionar Centro:", lista_centros_g, key="sel_centro_p2_gestion")
-
-        id_centro_actual = int(df_centros.loc[df_centros['centro'] == centro_sel_g, 'id_centro'].values[0])
-        st.divider()
-
+    if id_centro_activo:
+        # ----------------------------------------------------------------------
+        # 1. GESTIÓN DE PERSONAL
+        # ----------------------------------------------------------------------
         st.subheader("👥 Gestión de Personal")
         col_alta_trab, col_baja_trab = st.columns(2)
 
@@ -481,34 +627,21 @@ with tab_gestion:
                 if st.form_submit_button("Registrar Trabajador"):
                     if nombre_trab.strip():
                         try:
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                """
-                                INSERT INTO trabajadores (nombre, dni, id_centro, fecha_alta, activo)
-                                VALUES (%s, %s, %s, %s, 1)
-                                """,
-                                (nombre_trab.strip(), dni_trab.strip(), id_centro_actual, fecha_alta_trab)
-                            )
+                            q_insert_trab = "INSERT INTO trabajadores (nombre, dni, id_centro, fecha_alta, activo) VALUES (?, ?, ?, ?, 1)"
+                            query_db(conn, DB_ENGINE, q_insert_trab, (nombre_trab.strip(), dni_trab.strip(), id_centro_activo, str(fecha_alta_trab)))
                             conn.commit()
-                            cursor.close()
-                            st.success(f"✔ Trabajador '{nombre_trab.strip()}' registrado correctamente.")
+                            st.success(f"✔ Trabajador '{nombre_trab.strip()}' registrado.")
                             st.rerun()
                         except Exception as e:
-                            conn.rollback()
                             st.error(f"Error al registrar trabajador: {e}")
                     else:
-                        st.warning("El nombre del trabajador no puede estar vacío.")
+                        st.warning("El nombre es obligatorio.")
 
         with col_baja_trab:
             st.markdown("##### ➖ Dar de Baja Trabajador")
             try:
-                query_trab_activos = """
-                    SELECT t.id_trabajador, t.nombre 
-                    FROM trabajadores t
-                    WHERE t.id_centro = %s AND t.activo = 1
-                    ORDER BY t.nombre ASC
-                """
-                df_trab_activos = pd.read_sql(query_trab_activos, conn, params=(id_centro_actual,))
+                query_trab_activos = "SELECT t.id_trabajador, t.nombre FROM trabajadores t WHERE t.id_centro = ? AND t.activo = 1 ORDER BY t.nombre ASC"
+                df_trab_activos = read_sql_db(query_trab_activos, conn, DB_ENGINE, params=(id_centro_activo,))
 
                 if not df_trab_activos.empty:
                     with st.form("baja_trabajador_form"):
@@ -516,22 +649,23 @@ with tab_gestion:
                         trab_a_baja = st.selectbox("Seleccionar Trabajador:", df_trab_activos['selector'])
                         fecha_baja_trab = st.date_input("Fecha de Baja", value=pd.to_datetime("today"))
 
-                        if st.form_submit_button("Dar de Baja Trabajador"):
+                        if st.form_submit_button("Dar de Baja"):
                             id_trab_baja = int(trab_a_baja.split(" - ")[0])
-                            cursor = conn.cursor()
-                            cursor.execute("UPDATE trabajadores SET activo = 0, fecha_baja = %s WHERE id_trabajador = %s", (fecha_baja_trab, id_trab_baja))
-                            cursor.execute("UPDATE asignaciones_dosimetros SET activo = 0 WHERE id_trabajador = %s", (id_trab_baja,))
+                            query_db(conn, DB_ENGINE, "UPDATE trabajadores SET activo = 0, fecha_baja = ? WHERE id_trabajador = ?", (str(fecha_baja_trab), id_trab_baja))
+                            query_db(conn, DB_ENGINE, "UPDATE asignaciones_dosimetros SET activo = 0 WHERE id_trabajador = ?", (id_trab_baja,))
                             conn.commit()
-                            cursor.close()
-                            st.success(f"✔ Trabajador ID {id_trab_baja} dado de baja.")
+                            st.success("✔ Trabajador dado de baja correctamente.")
                             st.rerun()
                 else:
-                    st.info(f"No hay trabajadores activos en {centro_sel_g}.")
+                    st.info(f"No hay trabajadores activos en {centro_seleccionado}.")
             except Exception as e:
-                st.error(f"Error al cargar la lista de trabajadores: {e}")
+                st.error(f"Error en trabajadores: {e}")
 
         st.divider()
 
+        # ----------------------------------------------------------------------
+        # 2. GESTIÓN DE DOSÍMETROS
+        # ----------------------------------------------------------------------
         st.subheader("📟 Gestión de Dosímetros de Área")
         col_alta_dosi, col_baja_dosi = st.columns(2)
 
@@ -539,393 +673,268 @@ with tab_gestion:
             st.markdown("##### ➕ Alta de Dosímetro")
             with st.form("alta_dosimetro_form", clear_on_submit=True):
                 codigo_serie = st.text_input("Código / Serie Dosímetro")
-                ubicacion = st.text_input("Ubicación (Ej: Quirófano 1 / RX)")
+                ubicacion = st.text_input("Ubicación (Ej: Sala Rayos 1)")
                 n_usuario_cnd = st.text_input("Nº Usuario CND")
                 n_instalacion_cnd = st.text_input("Nº Instalación CND")
 
                 if st.form_submit_button("Añadir Dosímetro"):
                     if codigo_serie.strip():
                         try:
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                """
-                                INSERT INTO dosimetros (id_centro, codigo_serie, ubicacion, n_usuario_cnd, n_instalacion_cnd, activo) 
-                                VALUES (%s, %s, %s, %s, %s, 1)
-                                """,
-                                (id_centro_actual, codigo_serie.strip(), ubicacion.strip(), n_usuario_cnd.strip(), n_instalacion_cnd.strip())
-                            )
+                            q_ins_dosi = "INSERT INTO dosimetros (id_centro, codigo_serie, ubicacion, n_usuario_cnd, n_instalacion_cnd, activo) VALUES (?, ?, ?, ?, ?, 1)"
+                            query_db(conn, DB_ENGINE, q_ins_dosi, (id_centro_activo, codigo_serie.strip(), ubicacion.strip(), n_usuario_cnd.strip(), n_instalacion_cnd.strip()))
                             conn.commit()
-                            cursor.close()
                             st.success("✔ Dosímetro registrado correctamente.")
                             st.rerun()
                         except Exception as e:
-                            conn.rollback()
-                            st.error(f"Error al guardar el dosímetro: {e}")
+                            st.error(f"Error al guardar dosímetro: {e}")
                     else:
                         st.warning("El código de serie es obligatorio.")
 
         with col_baja_dosi:
             st.markdown("##### ➖ Retirar Dosímetro Activo")
             try:
-                query_dosi_activos = """
-                    SELECT d.id_dosimetro, d.codigo_serie, d.ubicacion 
-                    FROM dosimetros d
-                    WHERE d.id_centro = %s AND d.activo = 1
-                """
-                df_dosi_activos = pd.read_sql(query_dosi_activos, conn, params=(id_centro_actual,))
+                query_dosi_activos = "SELECT d.id_dosimetro, d.codigo_serie, d.ubicacion FROM dosimetros d WHERE d.id_centro = ? AND d.activo = 1"
+                df_dosi_activos = read_sql_db(query_dosi_activos, conn, DB_ENGINE, params=(id_centro_activo,))
 
                 if not df_dosi_activos.empty:
                     with st.form("baja_dosimetro_form"):
-                        df_dosi_activos['selector'] = df_dosi_activos['id_dosimetro'].astype(str) + " - " + df_dosi_activos['codigo_serie'] + " (" + df_dosi_activos['ubicacion'].fillna('Sin ub.') + ")"
+                        df_dosi_activos['selector'] = df_dosi_activos['id_dosimetro'].astype(str) + " - " + df_dosi_activos['codigo_serie'] + " (" + df_dosi_activos['ubicacion'].fillna('-') + ")"
                         dosi_a_baja = st.selectbox("Seleccionar Dosímetro:", df_dosi_activos['selector'])
 
                         if st.form_submit_button("Retirar Dosímetro"):
                             id_dosi_baja = int(dosi_a_baja.split(" - ")[0])
-                            cursor = conn.cursor()
-                            cursor.execute("UPDATE dosimetros SET activo = 0 WHERE id_dosimetro = %s", (id_dosi_baja,))
-                            cursor.execute("UPDATE asignaciones_dosimetros SET activo = 0 WHERE id_dosimetro = %s", (id_dosi_baja,))
+                            query_db(conn, DB_ENGINE, "UPDATE dosimetros SET activo = 0 WHERE id_dosimetro = ?", (id_dosi_baja,))
+                            query_db(conn, DB_ENGINE, "UPDATE asignaciones_dosimetros SET activo = 0 WHERE id_dosimetro = ?", (id_dosi_baja,))
                             conn.commit()
-                            cursor.close()
-                            st.success(f"✔ Dosímetro ID {id_dosi_baja} retirado.")
+                            st.success("✔ Dosímetro retirado.")
                             st.rerun()
                 else:
-                    st.info(f"No hay dosímetros activos registrados en {centro_sel_g}.")
+                    st.info(f"No hay dosímetros activos registrados en {centro_seleccionado}.")
             except Exception as e:
-                st.error(f"Error al cargar la lista de dosímetros: {e}")
+                st.error(f"Error en dosímetros: {e}")
 
         st.divider()
 
+        # ----------------------------------------------------------------------
+        # 3. ASIGNACIONES MÚLTIPLES (TRABAJADORES ↔ DOSÍMETROS)
+        # ----------------------------------------------------------------------
         st.subheader("🔗 Asignación Múltiple (Trabajadores ↔ Dosímetros)")
         col_nueva_asig, col_borra_asig = st.columns(2)
 
         with col_nueva_asig:
             st.markdown("##### ➕ Vincular Trabajador y Dosímetro")
             try:
-                query_trabs_centro = "SELECT id_trabajador, nombre FROM trabajadores WHERE id_centro = %s AND activo = 1 ORDER BY nombre ASC"
-                df_trabs_asig = pd.read_sql(query_trabs_centro, conn, params=(id_centro_actual,))
+                q_t = "SELECT id_trabajador, nombre FROM trabajadores WHERE id_centro = ? AND activo = 1 ORDER BY nombre ASC"
+                df_t_asig = read_sql_db(q_t, conn, DB_ENGINE, params=(id_centro_activo,))
 
-                query_dosis_centro = "SELECT id_dosimetro, codigo_serie, ubicacion FROM dosimetros WHERE id_centro = %s AND activo = 1 ORDER BY codigo_serie ASC"
-                df_dosis_asig = pd.read_sql(query_dosis_centro, conn, params=(id_centro_actual,))
+                q_d = "SELECT id_dosimetro, codigo_serie, ubicacion FROM dosimetros WHERE id_centro = ? AND activo = 1 ORDER BY codigo_serie ASC"
+                df_d_asig = read_sql_db(q_d, conn, DB_ENGINE, params=(id_centro_activo,))
 
-                if not df_trabs_asig.empty and not df_dosis_asig.empty:
+                if not df_t_asig.empty and not df_d_asig.empty:
                     with st.form("form_nueva_asignacion", clear_on_submit=True):
-                        df_trabs_asig['selector'] = df_trabs_asig['id_trabajador'].astype(str) + " - " + df_trabs_asig['nombre']
-                        df_dosis_asig['selector'] = df_dosis_asig['id_dosimetro'].astype(str) + " - " + df_dosis_asig['codigo_serie'] + " (" + df_dosis_asig['ubicacion'].fillna('Sin ub.') + ")"
+                        df_t_asig['selector'] = df_t_asig['id_trabajador'].astype(str) + " - " + df_t_asig['nombre']
+                        df_d_asig['selector'] = df_d_asig['id_dosimetro'].astype(str) + " - " + df_d_asig['codigo_serie'] + " (" + df_d_asig['ubicacion'].fillna('-') + ")"
 
-                        trab_sel = st.selectbox(f"1. Seleccionar Trabajador ({centro_sel_g}):", df_trabs_asig['selector'], key="sel_trab_asig")
-                        dosi_sel = st.selectbox(f"2. Seleccionar Dosímetro ({centro_sel_g}):", df_dosis_asig['selector'], key="sel_dosi_asig")
+                        trab_sel = st.selectbox("Seleccionar Trabajador:", df_t_asig['selector'])
+                        dosi_sel = st.selectbox("Seleccionar Dosímetro:", df_d_asig['selector'])
                         fecha_asig = st.date_input("Fecha Asignación", value=pd.to_datetime("today"))
 
                         if st.form_submit_button("Crear Asignación"):
                             id_trab = int(trab_sel.split(" - ")[0])
                             id_dosi = int(dosi_sel.split(" - ")[0])
 
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT id_asignacion FROM asignaciones_dosimetros WHERE id_trabajador = %s AND id_dosimetro = %s AND activo = 1", (id_trab, id_dosi))
-                            ya_existe = cursor.fetchone()
-
-                            if ya_existe:
-                                st.warning("⚠️ Esta asignación exacta ya se encuentra activa.")
+                            q_check = "SELECT id_asignacion FROM asignaciones_dosimetros WHERE id_trabajador = ? AND id_dosimetro = ? AND activo = 1"
+                            cur_check = query_db(conn, DB_ENGINE, q_check, (id_trab, id_dosi))
+                            if cur_check.fetchone():
+                                st.warning("⚠️ Esta asignación ya se encuentra activa.")
                             else:
-                                cursor.execute(
-                                    """
-                                    INSERT INTO asignaciones_dosimetros (id_trabajador, id_dosimetro, fecha_asignacion, activo)
-                                    VALUES (%s, %s, %s, 1)
-                                    """,
-                                    (id_trab, id_dosi, fecha_asig)
-                                )
+                                q_ins_asig = "INSERT INTO asignaciones_dosimetros (id_trabajador, id_dosimetro, fecha_asignacion, activo) VALUES (?, ?, ?, 1)"
+                                query_db(conn, DB_ENGINE, q_ins_asig, (id_trab, id_dosi, str(fecha_asig)))
                                 conn.commit()
-                                cursor.close()
                                 st.success("✔ Asignación registrada correctamente.")
                                 st.rerun()
                 else:
-                    st.info(f"Se requiere al menos 1 trabajador activo y 1 dosímetro activo en {centro_sel_g}.")
+                    st.info(f"Se requiere al menos 1 trabajador y 1 dosímetro activo en {centro_seleccionado} para crear asignaciones.")
             except Exception as e:
-                st.error(f"Error al cargar las opciones de asignación: {e}")
+                st.error(f"Error al cargar opciones de vinculación: {e}")
 
         with col_borra_asig:
             st.markdown("##### ➖ Finalizar Asignación Específica")
             try:
                 query_asig_activas = """
-                    SELECT ad.id_asignacion, t.nombre AS trabajador, d.codigo_serie AS dosimetro, d.ubicacion
+                    SELECT 
+                        ad.id_asignacion,
+                        t.nombre AS trabajador,
+                        d.codigo_serie AS dosimetro,
+                        d.ubicacion
                     FROM asignaciones_dosimetros ad
                     JOIN trabajadores t ON ad.id_trabajador = t.id_trabajador
                     JOIN dosimetros d ON ad.id_dosimetro = d.id_dosimetro
-                    WHERE t.id_centro = %s AND ad.activo = 1 AND t.activo = 1
+                    WHERE t.id_centro = ? AND ad.activo = 1 AND t.activo = 1
                     ORDER BY t.nombre ASC
                 """
-                df_asig_desact = pd.read_sql(query_asig_activas, conn, params=(id_centro_actual,))
+                df_asig_activas = read_sql_db(query_asig_activas, conn, DB_ENGINE, params=(id_centro_activo,))
 
-                if not df_asig_desact.empty:
-                    with st.form("form_desactivar_asignacion"):
-                        df_asig_desact['selector'] = df_asig_desact['id_asignacion'].astype(str) + " - " + df_asig_desact['trabajador'] + " ↔ " + df_asig_desact['dosimetro'] + " (" + df_asig_desact['ubicacion'].fillna('-') + ")"
-                        asig_a_borrar = st.selectbox("Seleccionar Asignación a finalizar:", df_asig_desact['selector'])
+                if not df_asig_activas.empty:
+                    with st.form("form_finalizar_asig"):
+                        df_asig_activas['selector'] = (
+                            df_asig_activas['id_asignacion'].astype(str) + " - " + 
+                            df_asig_activas['trabajador'] + " ↔ " + df_asig_activas['dosimetro'] + 
+                            " (" + df_asig_activas['ubicacion'].fillna('-') + ")"
+                        )
+                        asig_a_fin = st.selectbox("Seleccionar Asignación a finalizar:", df_asig_activas['selector'])
 
                         if st.form_submit_button("Finalizar Asignación"):
-                            id_asig_fin = int(asig_a_borrar.split(" - ")[0])
-                            cursor = conn.cursor()
-                            cursor.execute("UPDATE asignaciones_dosimetros SET activo = 0 WHERE id_asignacion = %s", (id_asig_fin,))
+                            id_asig_fin = int(asig_a_fin.split(" - ")[0])
+                            query_db(conn, DB_ENGINE, "UPDATE asignaciones_dosimetros SET activo = 0 WHERE id_asignacion = ?", (id_asig_fin,))
                             conn.commit()
-                            cursor.close()
                             st.success(f"✔ Asignación ID {id_asig_fin} finalizada.")
                             st.rerun()
                 else:
-                    st.info(f"No hay asignaciones activas para finalizar en {centro_sel_g}.")
+                    st.info(f"No hay asignaciones activas para finalizar en {centro_seleccionado}.")
             except Exception as e:
-                st.error(f"Error al cargar las asignaciones activas: {e}")
+                st.error(f"Error al cargar asignaciones para finalizar: {e}")
 
         st.divider()
 
-        st.subheader(f"📋 Resumen de Asignaciones Activas en {centro_sel_g}")
-        query_resumen_asignaciones = """
+        # ----------------------------------------------------------------------
+        # 4. RESUMEN DE ASIGNACIONES ACTIVAS
+        # ----------------------------------------------------------------------
+        st.subheader(f"📋 Resumen de Asignaciones Activas en {centro_seleccionado}")
+        query_resumen = """
             SELECT 
-                ad.id_asignacion AS "ID Asig.",
-                t.id_trabajador AS "ID Trab.",
-                t.nombre AS "Trabajador",
-                d.id_dosimetro AS "ID Dosi.",
-                d.codigo_serie AS "Código Dosímetro",
-                d.ubicacion AS "Ubicación / Sala",
-                d.n_usuario_cnd AS "Usuario CND",
-                d.n_instalacion_cnd AS "Instalación CND",
-                COALESCE(CAST(ad.fecha_asignacion AS TEXT), '-') AS "Fecha Asignación"
+                ad.id_asignacion AS 'ID Asig.',
+                t.id_trabajador AS 'ID Trab.',
+                t.nombre AS 'Trabajador',
+                d.id_dosimetro AS 'ID Dosi.',
+                d.codigo_serie AS 'Código Dosímetro',
+                d.ubicacion AS 'Ubicación / Sala',
+                d.n_usuario_cnd AS 'Usuario CND',
+                d.n_instalacion_cnd AS 'Instalación CND',
+                COALESCE(CAST(ad.fecha_asignacion AS VARCHAR), '-') AS 'Fecha Asignación'
             FROM asignaciones_dosimetros ad
             JOIN trabajadores t ON ad.id_trabajador = t.id_trabajador
             JOIN dosimetros d ON ad.id_dosimetro = d.id_dosimetro
-            JOIN centros c ON t.id_centro = c.id_centro
-            WHERE c.nombre = %s AND ad.activo = 1 AND t.activo = 1
+            WHERE t.id_centro = ? AND ad.activo = 1 AND t.activo = 1
             ORDER BY t.nombre ASC, ad.id_asignacion DESC
         """
-
         try:
-            df_asig_centro = pd.read_sql(query_resumen_asignaciones, conn, params=(centro_sel_g,))
-            if not df_asig_centro.empty:
-                st.caption(f"Mostrando {len(df_asig_centro)} asignaciones activas.")
-                st.dataframe(df_asig_centro, use_container_width=True, hide_index=True)
+            df_resumen = read_sql_db(query_resumen, conn, DB_ENGINE, params=(id_centro_activo,))
+            if not df_resumen.empty:
+                st.caption(f"Mostrando {len(df_resumen)} asignaciones activas.")
+                st.dataframe(df_resumen, use_container_width=True, hide_index=True)
             else:
-                st.info(f"No hay asignaciones activas registradas en {centro_sel_g}.")
+                st.info(f"No hay asignaciones activas registradas en {centro_seleccionado}.")
         except Exception as e:
             st.error(f"Error al cargar el resumen de asignaciones: {e}")
-    else:
-        st.warning("No hay centros asignados según su rol de usuario.")
 
-
-# ==========================================
-# PESTAÑA 3: GESTIÓN DE CENTROS (Admin / Coordinador)
-# ==========================================
+# ==============================================================================
+# PESTAÑA 3: GESTIÓN DE CENTROS
+# ==============================================================================
 if rol in ['Admin', 'Coordinador']:
     with tab_centros:
-        st.header("Añadir un Nuevo Centro")
+        st.header("🏢 Gestión y Creación de Centros")
         
         if rol == 'Admin':
-            query_areas = "SELECT id_area, nombre FROM areas_sanitarias ORDER BY nombre ASC"
-            df_areas = pd.read_sql(query_areas, conn)
+            df_areas = read_sql_db("SELECT id_area, nombre FROM areas_sanitarias ORDER BY nombre ASC", conn, DB_ENGINE)
         else:
-            query_areas = "SELECT id_area, nombre FROM areas_sanitarias WHERE id_area = %s"
-            df_areas = pd.read_sql(query_areas, conn, params=(id_area_user,))
+            df_areas = read_sql_db("SELECT id_area, nombre FROM areas_sanitarias WHERE id_area = ?", conn, DB_ENGINE, params=(id_area_user,))
 
         if not df_areas.empty:
-            st.caption("Asigna el centro a su Área Sanitaria e indica el código de instalación asignado por el CND.")
-
+            st.caption("Añade un centro sanitario asignándole su código de instalación CND correspondiente.")
             with st.form("nuevo_centro", clear_on_submit=True):
                 col1, col2 = st.columns(2)
                 with col1:
-                    nombre_centro = st.text_input("Nombre del Centro (Ej: CAP Besós)")
-                    if len(df_areas) == 1:
-                        area_seleccionada = df_areas['nombre'].iloc[0]
-                        st.selectbox("Área Sanitaria", [area_seleccionada], disabled=True)
-                    else:
-                        area_seleccionada = st.selectbox("Área Sanitaria", df_areas['nombre'])
-
+                    nombre_centro = st.text_input("Nombre del Centro")
+                    area_seleccionada = st.selectbox("Área Sanitaria", df_areas['nombre'])
                 with col2:
-                    n_instalacion_cnd = st.text_input("Nº Instalación CND (Ej: 08B9)", help="Código de 4 caracteres del CND.")
+                    n_instalacion_cnd = st.text_input("Nº Instalación CND (4 digitos)")
 
-                btn_crear = st.form_submit_button("💾 Crear Centro", type="primary")
-
-                if btn_crear:
-                    if not nombre_centro.strip() or not n_instalacion_cnd.strip():
-                        st.warning("⚠️ Debes rellenar el Nombre del Centro y el Nº de Instalación CND.")
-                    else:
+                if st.form_submit_button("💾 Crear Centro"):
+                    if nombre_centro.strip() and n_instalacion_cnd.strip():
                         try:
                             id_area = df_areas.loc[df_areas['nombre'] == area_seleccionada, 'id_area'].values[0]
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                "INSERT INTO centros (nombre, id_area_sanitaria, n_instalacion_cnd) VALUES (%s, %s, %s)",
-                                (nombre_centro.strip(), int(id_area), n_instalacion_cnd.strip().upper())
-                            )
+                            q_ins_c = "INSERT INTO centros (nombre, id_area_sanitaria, n_instalacion_cnd) VALUES (?, ?, ?)"
+                            query_db(conn, DB_ENGINE, q_ins_c, (nombre_centro.strip(), int(id_area), n_instalacion_cnd.strip().upper()))
                             conn.commit()
-                            cursor.close()
-                            st.success(f"🎉 Centro '{nombre_centro}' creado en **{area_seleccionada}**.")
+                            st.success(f"🎉 Centro '{nombre_centro}' creado con éxito.")
                             st.rerun()
                         except Exception as e:
-                            conn.rollback()
-                            if "unique" in str(e).lower() or "duplicate key" in str(e).lower():
-                                st.error(f"❌ Ya existe un centro registrado con la Instalación CND `{n_instalacion_cnd.strip().upper()}`.")
-                            else:
-                                st.error(f"❌ Error al crear el centro: {e}")
-        else:
-            st.warning("⚠️ No se encontró un Área Sanitaria asociada a tu perfil.")
-
+                            st.error(f"Error al crear centro: {e}")
+                    else:
+                        st.warning("⚠️ Debes rellenar todos los campos.")
 
 # ==============================================================================
-# PESTAÑA 4: LECTURAS DOSIMÉTRICAS Y CARGA PDF
+# PESTAÑA 4: LECTURAS DOSIMÉTRICAS
 # ==============================================================================
 with tab_lecturas:
     st.header("📄 Gestión e Importación de Lecturas Dosimétricas")
+    st.info(f"📍 **Centro Activo:** {centro_seleccionado}")
 
-    if not df_centros.empty:
-        lista_centros_l = df_centros['centro'].unique()
-        
-        if len(lista_centros_l) == 1:
-            centro_sel_l = lista_centros_l[0]
-            st.info(f"📍 **Centro activo:** {centro_sel_l}")
-        else:
-            centro_sel_l = st.selectbox("Seleccionar Centro:", lista_centros_l, key="sel_centro_p3_lecturas")
+    subtab_upload, subtab_ver = st.tabs(["📤 Subir Informe PDF", "📊 Consultar Histórico"])
 
-        id_centro_lecturas = int(df_centros.loc[df_centros['centro'] == centro_sel_l, 'id_centro'].values[0])
-        st.divider()
-
-        subtab_upload, subtab_ver = st.tabs(["📤 Subir Informe PDF", "📊 Consultar Histórico de Lecturas"])
-
-        with subtab_upload:
-            st.subheader("Subir Informe Dosimétrico (PDF)")
-            st.caption("Importa y almacena directamente las lecturas registradas en el informe del CND sin aplicar cálculos.")
-
-            uploaded_file = st.file_uploader("Selecciona el archivo PDF de lecturas:", type=["pdf"], key="pdf_uploader_cnd")
-
-            if uploaded_file is not None:
-                st.success(f"📂 Archivo cargado: **{uploaded_file.name}**")
-                
-                if st.button("⚙️ Extraer e Importar Lecturas", type="primary"):
-                    try:
-                        with st.spinner("Extrayendo lecturas del informe PDF..."):
-                            lecturas_extraidas = extraer_lecturas_pdf_integrado(uploaded_file)
-
-                        if lecturas_extraidas:
-                            df_resultado = pd.DataFrame(lecturas_extraidas)
-                            df_resultado["num_usuario"] = df_resultado["num_usuario"].astype(str).str.strip()
-                            df_resultado["num_instalacion"] = df_resultado["num_instalacion"].astype(str).str.strip()
-
-                            st.write(f"✔ **Se han extraído {len(df_resultado)} lecturas del archivo:**")
-                            df_vista = df_resultado.rename(columns={
-                                "num_instalacion": "Instalación CND",
-                                "num_usuario": "Usuario CND",
-                                "nombre_apellidos": "Nombre / Identificador",
-                                "tipo": "Tipo",
-                                "mes": "Mes",
-                                "anio": "Año",
-                                "hp10_leida": "Hp(10) Leída (mSv)",
-                                "hp007_leida": "Hp(0,07) Leída (mSv)"
-                            })
-
-                            st.dataframe(
-                                df_vista[[c for c in ["Instalación CND", "Usuario CND", "Nombre / Identificador", "Tipo", "Mes", "Año", "Hp(10) Leída (mSv)", "Hp(0,07) Leída (mSv)"] if c in df_vista.columns]],
-                                use_container_width=True,
-                                hide_index=True
-                            )
-
-                            cursor = conn.cursor()
-                            registros_insertados = 0
-
-                            # PostgreSQL: UPSERT (INSERT ON CONFLICT) en lugar de INSERT OR REPLACE
-                            for _, row in df_resultado.iterrows():
-                                cursor.execute(
-                                    """
-                                    INSERT INTO lecturas (n_instalacion_cnd, n_usuario_cnd, mes, anio, hp10_asignada, hp007_asignada)
-                                    VALUES (%s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT (n_instalacion_cnd, n_usuario_cnd, mes, anio) 
-                                    DO UPDATE SET 
-                                        hp10_asignada = EXCLUDED.hp10_asignada,
-                                        hp007_asignada = EXCLUDED.hp007_asignada;
-                                    """,
-                                    (
-                                        str(row['num_instalacion']),
-                                        str(row['num_usuario']),
-                                        str(row['mes']),
-                                        int(row['anio']),
-                                        float(row['hp10_leida']),
-                                        float(row['hp007_leida'])
-                                    )
-                                )
-                                registros_insertados += 1
-
-                            conn.commit()
-                            cursor.close()
-                            st.success(f"🎉 **¡Éxito!** Se han registrado {registros_insertados} lecturas en PostgreSQL.")
-                            st.balloons()
-                        else:
-                            st.warning("⚠️ No se identificaron lecturas válidas en el PDF.")
-
-                    except Exception as e:
-                        conn.rollback()
-                        st.error(f"Error al procesar el archivo PDF: {e}")
-
-        with subtab_ver:
-            if not df_centros.empty:
-                st.subheader("📊 Histórico de Lecturas Dosimétricas")
-
-                col_c1, col_c2, col_c3 = st.columns([2, 1, 1])
-
-                with col_c1:
-                    centro_sel_l = st.selectbox("🏢 Seleccionar Centro:", df_centros["centro"].unique(), key="sb_centro_historico")
-
-                n_inst_sel = df_centros.loc[df_centros["centro"] == centro_sel_l, "n_instalacion_cnd"].values[0]
-
-                with col_c2:
-                    filtro_anio = st.selectbox("📅 Año:", ["Todos", "2026", "2025"], index=0, key="sb_anio_historico")
-
-                with col_c3:
-                    filtro_usuario = st.text_input("🔍 Nº Usuario CND (Opcional):", placeholder="Ej: 109, 001...", key="ti_usuario_historico")
-
+    # --------------------------------------------------------------------------
+    # SUB-PESTAÑA A: SUBIR PDF SIN DUPLICADOS
+    # --------------------------------------------------------------------------
+    with subtab_upload:
+        uploaded_file = st.file_uploader("Selecciona el archivo PDF de lecturas:", type=["pdf"], key="pdf_uploader_cnd")
+        if uploaded_file is not None:
+            if st.button("⚙️ Extraer e Importar Lecturas", type="primary"):
                 try:
-                    where_clauses = ["l.n_instalacion_cnd = %s"]
-                    params_historico = [str(n_inst_sel)]
+                    lecturas_extraidas = extraer_lecturas_pdf_integrado(uploaded_file)
+                    if lecturas_extraidas:
+                        df_resultado = pd.DataFrame(lecturas_extraidas)
+                        registros_actualizados = 0
 
-                    if filtro_anio != "Todos":
-                        where_clauses.append("l.anio = %s")
-                        params_historico.append(int(filtro_anio))
+                        for _, row in df_resultado.iterrows():
+                            inst = str(row['num_instalacion']).strip()
+                            usr = str(row['num_usuario']).strip()
+                            mes = str(row['mes']).strip()
+                            anio = int(row['anio'])
+                            hp10 = float(row['hp10_leida'])
+                            hp007 = float(row['hp007_leida'])
 
-                    if filtro_usuario.strip():
-                        where_clauses.append("l.n_usuario_cnd = %s")
-                        params_historico.append(filtro_usuario.strip())
+                            # 1. Eliminar si ya existe exactamente esa lectura (evita duplicados)
+                            q_del = "DELETE FROM lecturas WHERE n_instalacion_cnd = ? AND n_usuario_cnd = ? AND mes = ? AND anio = ?"
+                            query_db(conn, DB_ENGINE, q_del, (inst, usr, mes, anio))
 
-                    where_sql = " AND ".join(where_clauses)
+                            # 2. Insertar el registro nuevo / actualizado
+                            q_ins = """
+                                INSERT INTO lecturas 
+                                (n_instalacion_cnd, n_usuario_cnd, mes, anio, hp10_asignada, hp007_asignada)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """
+                            query_db(conn, DB_ENGINE, q_ins, (inst, usr, mes, anio, hp10, hp007))
+                            registros_actualizados += 1
 
-                    query_historico = f"""
-                        SELECT 
-                            l.n_instalacion_cnd AS "Instalación CND",
-                            l.n_usuario_cnd AS "Usuario / Historia CND",
-                            (l.mes || ' ' || CAST(l.anio AS TEXT)) AS "Mes / Periodo",
-                            l.hp10_asignada AS "Hp(10) Leída (mSv)",
-                            l.hp007_asignada AS "Hp(0,07) Leída (mSv)"
-                        FROM lecturas l
-                        WHERE l.id IN (
-                            SELECT MAX(id)
-                            FROM lecturas
-                            WHERE {where_sql}
-                            GROUP BY n_instalacion_cnd, n_usuario_cnd, mes, anio
-                        )
-                        ORDER BY l.anio DESC, l.id DESC
-                    """
-
-                    df_historico = pd.read_sql(query_historico, conn, params=params_historico)
-
-                    if not df_historico.empty:
-                        st.caption(f"Mostrando {len(df_historico)} lecturas únicas para {centro_sel_l} (Instalación: {n_inst_sel}).")
-                        st.dataframe(df_historico, use_container_width=True, hide_index=True)
-
-                        csv = df_historico.to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            label="📥 Descargar Consulta en CSV",
-                            data=csv,
-                            file_name=f"historico_dosimetria_{str(centro_sel_l).lower().replace(' ', '_')}.csv",
-                            mime="text/csv"
-                        )
+                        conn.commit()
+                        st.success(f"✔ ¡Éxito! Se guardaron/actualizaron {registros_actualizados} lecturas sin duplicados.")
                     else:
-                        st.info(f"No se encontraron registros de lecturas para {centro_sel_l} con los filtros seleccionados.")
-
+                        st.warning("No se encontraron lecturas válidas en el PDF.")
                 except Exception as e:
-                    st.error(f"Error al consultar el histórico de lecturas: {e}")
-            else:
-                st.warning("No hay centros disponibles según su rol de usuario.")
-    else:
-        st.warning("No hay centros disponibles según su rol de usuario.")
+                    st.error(f"Error al procesar el PDF: {e}")
+
+    # --------------------------------------------------------------------------
+    # SUB-PESTAÑA B: HISTÓRICO
+    # --------------------------------------------------------------------------
+    with subtab_ver:
+        if id_centro_activo:
+            try:
+                n_inst_sel = df_centros.loc[df_centros["id_centro"] == id_centro_activo, "n_instalacion_cnd"].values[0]
+                query_historico = """
+                    SELECT n_instalacion_cnd AS "Instalación", n_usuario_cnd AS "Usuario CND", 
+                           (mes || ' ' || CAST(anio AS VARCHAR)) AS "Periodo", 
+                           hp10_asignada AS "Hp(10)", hp007_asignada AS "Hp(0,07)"
+                    FROM lecturas
+                    WHERE n_instalacion_cnd = ?
+                    ORDER BY anio DESC, id DESC
+                """
+                df_historico = read_sql_db(query_historico, conn, DB_ENGINE, params=(str(n_inst_sel),))
+                if not df_historico.empty:
+                    st.dataframe(df_historico, use_container_width=True, hide_index=True)
+                else:
+                    st.info(f"No hay lecturas registradas para la instalación CND {n_inst_sel}.")
+            except Exception as e:
+                st.error(f"Error al cargar histórico: {e}")
+
+conn.close()
