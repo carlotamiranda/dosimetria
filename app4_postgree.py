@@ -36,6 +36,7 @@ def get_db_connection():
     if db_url and HAS_PSYCOPG2:
         try:
             conn = psycopg2.connect(db_url, connect_timeout=10)
+            conn.autocommit = True  # <--- ESTA LÍNEA ES LA SALVACIÓN
             return conn, "postgresql"
         except Exception:
             pass
@@ -59,11 +60,21 @@ def query_db(conn, engine, query, params=()):
 
 
 def read_sql_db(query, conn, engine, params=None):
-    """ Adapta pd.read_sql para ambos motores """
+    """ Adapta pd.read_sql para ambos motores y evita bloqueos """
     q = query
     if engine == "postgresql":
         q = q.replace("?", "%s")
-    return pd.read_sql(q, conn, params=params)
+        
+    try:
+        return pd.read_sql(q, conn, params=params)
+    except Exception as e:
+        # Si falla en Postgres, forzamos un rollback para desbloquear la base de datos
+        if engine == "postgresql" and hasattr(conn, 'rollback'):
+            try:
+                conn.rollback()
+            except:
+                pass
+        raise e
 
 
 def calcular_dosis_trabajador(lista_dosis):
