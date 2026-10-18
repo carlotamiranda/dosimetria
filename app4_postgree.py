@@ -1034,69 +1034,102 @@ if rol == 'Admin':
         st.header("👤 Gestión de Accesos y Aprobaciones")
         
         try:
-            # Usuarios pendientes
+            # 1. Solicitudes pendientes
             st.subheader("🔔 Solicitudes Pendientes")
             df_pend = read_sql_db("SELECT id_usuario, username, estado FROM usuarios WHERE estado = 'Pendiente'", conn, DB_ENGINE)
             
             if not df_pend.empty:
-                df_areas = read_sql_db("SELECT id_area, nombre FROM areas_sanitarias ORDER BY nombre", conn, DB_ENGINE)
-                df_cens = read_sql_db("SELECT id_centro, nombre, id_area_sanitaria FROM centros ORDER BY nombre", conn, DB_ENGINE)
+                df_areas = read_sql_db("SELECT id_area, nombre FROM areas_sanitarias ORDER BY nombre ASC", conn, DB_ENGINE)
+                df_cens = read_sql_db("SELECT id_centro, nombre, id_area_sanitaria FROM centros ORDER BY nombre ASC", conn, DB_ENGINE)
+                
+                lista_nombres_areas = df_areas['nombre'].tolist() if not df_areas.empty else []
+                lista_nombres_centros = df_cens['nombre'].tolist() if not df_cens.empty else []
                 
                 for _, row in df_pend.iterrows():
-                    with st.expander(f"Solicitud: {row['username']}"):
+                    with st.expander(f"Solicitud: {row['username']}", expanded=True):
                         with st.form(f"form_aprob_{row['id_usuario']}"):
                             col_rol, col_area, col_cen = st.columns(3)
                             
                             with col_rol:
-                                sel_rol = st.selectbox("Rol a asignar", ["Centro", "Coordinador", "Admin"])
+                                sel_rol = st.selectbox(
+                                    "Rol a asignar", 
+                                    ["Centro", "Coordinador", "Admin"],
+                                    key=f"rol_{row['id_usuario']}"
+                                )
                             with col_area:
-                                sel_area = st.selectbox("Área (Para Coordinador o Centro)", ["Ninguna"] + df_areas['nombre'].tolist())
+                                sel_area = st.selectbox(
+                                    "Área (para Coordinador)", 
+                                    ["Ninguna"] + lista_nombres_areas,
+                                    key=f"area_{row['id_usuario']}"
+                                )
                             with col_cen:
-                                # Filtramos centros si se elige un área
-                                if sel_area != "Ninguna":
-                                    id_ar = df_areas[df_areas['nombre'] == sel_area]['id_area'].values[0]
-                                    centros_filtrados = df_cens[df_cens['id_area_sanitaria'] == id_ar]['nombre'].tolist()
-                                else:
-                                    centros_filtrados = ["Ninguno"]
-                                sel_cen = st.selectbox("Centro", ["Ninguno"] + centros_filtrados)
+                                sel_cen = st.selectbox(
+                                    "Centro (para Rol Centro)", 
+                                    ["Ninguno"] + lista_nombres_centros,
+                                    key=f"cen_{row['id_usuario']}"
+                                )
                             
                             col_btn1, col_btn2 = st.columns([1, 4])
                             with col_btn1:
                                 if st.form_submit_button("✅ Aprobar"):
-                                    id_ar_val = df_areas[df_areas['nombre'] == sel_area]['id_area'].values[0] if sel_area != "Ninguna" else None
-                                    id_cen_val = df_cens[df_cens['nombre'] == sel_cen]['id_centro'].values[0] if sel_cen != "Ninguno" else None
+                                    id_ar_val = None
+                                    id_cen_val = None
                                     
-                                    q_upd = "UPDATE usuarios SET rol=%s, id_area_sanitaria=%s, id_centro=%s, estado='Aprobado' WHERE id_usuario=%s" if DB_ENGINE == "postgresql" else "UPDATE usuarios SET rol=?, id_area_sanitaria=?, id_centro=?, estado='Aprobado' WHERE id_usuario=?"
+                                    if sel_rol == "Coordinador":
+                                        if sel_area != "Ninguna" and not df_areas.empty:
+                                            id_ar_val = int(df_areas[df_areas['nombre'] == sel_area]['id_area'].values[0])
+                                    elif sel_rol == "Centro":
+                                        if sel_cen != "Ninguno" and not df_cens.empty:
+                                            fila_cen = df_cens[df_cens['nombre'] == sel_cen].iloc[0]
+                                            id_cen_val = int(fila_cen['id_centro'])
+                                            # Asignar automáticamente el área vinculada a este centro
+                                            if pd.notnull(fila_cen['id_area_sanitaria']):
+                                                id_ar_val = int(fila_cen['id_area_sanitaria'])
+                                    
+                                    q_upd = """
+                                        UPDATE usuarios 
+                                        SET rol=%s, id_area_sanitaria=%s, id_centro=%s, estado='Aprobado' 
+                                        WHERE id_usuario=%s
+                                    """ if DB_ENGINE == "postgresql" else """
+                                        UPDATE usuarios 
+                                        SET rol=?, id_area_sanitaria=?, id_centro=?, estado='Aprobado' 
+                                        WHERE id_usuario=?
+                                    """
                                     query_db(conn, DB_ENGINE, q_upd, (sel_rol, id_ar_val, id_cen_val, row['id_usuario']))
                                     conn.commit()
                                     st.cache_data.clear()
-                                    st.success(f"Usuario {row['username']} aprobado.")
+                                    st.success(f"✔ Usuario '{row['username']}' aprobado con rol {sel_rol}.")
                                     st.rerun()
+                                    
                             with col_btn2:
                                 if st.form_submit_button("🗑️ Rechazar y Eliminar"):
                                     q_del = "DELETE FROM usuarios WHERE id_usuario=%s" if DB_ENGINE == "postgresql" else "DELETE FROM usuarios WHERE id_usuario=?"
                                     query_db(conn, DB_ENGINE, q_del, (row['id_usuario'],))
                                     conn.commit()
                                     st.cache_data.clear()
-                                    st.success("Solicitud rechazada.")
+                                    st.success(f"Solicitud de '{row['username']}' rechazada.")
                                     st.rerun()
             else:
                 st.info("No hay solicitudes de acceso pendientes.")
                 
             st.divider()
             
-            # Usuarios activos
+            # 2. Listado de usuarios activos
             st.subheader("👥 Usuarios Activos")
             query_activos = """
-                SELECT u.id_usuario, u.username, u.rol, COALESCE(a.nombre, '-') as area, COALESCE(c.nombre, '-') as centro 
+                SELECT u.id_usuario AS "ID", u.username AS "Usuario", u.rol AS "Rol", 
+                       COALESCE(a.nombre, '-') AS "Área", COALESCE(c.nombre, '-') AS "Centro"
                 FROM usuarios u 
                 LEFT JOIN areas_sanitarias a ON u.id_area_sanitaria = a.id_area 
                 LEFT JOIN centros c ON u.id_centro = c.id_centro 
                 WHERE u.estado = 'Aprobado'
+                ORDER BY u.id_usuario ASC
             """
             df_activos = read_sql_db(query_activos, conn, DB_ENGINE)
             if not df_activos.empty:
                 st.dataframe(df_activos, use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay usuarios activos registrados.")
                 
         except Exception as e:
             st.error(f"Error en panel de usuarios: {e}")
