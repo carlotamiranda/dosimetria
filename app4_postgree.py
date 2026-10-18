@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import sqlite3
+import bcrypt
+
 
 try:
     import psycopg2
@@ -213,7 +215,7 @@ st.set_page_config(
 conn, DB_ENGINE = get_db_connection()
 
 # ==========================================
-# GESTIÓN DE SESIÓN Y LOGIN
+# GESTIÓN DE SESIÓN Y LOGIN (CON AUTORREGISTRO)
 # ==========================================
 if 'usuario_logueado' not in st.session_state:
     st.session_state['usuario_logueado'] = None
@@ -222,35 +224,99 @@ if 'usuario_logueado' not in st.session_state:
     st.session_state['nombre_area'] = None
     st.session_state['id_centro'] = None
 
+def hash_password(password_plana):
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password_plana.encode('utf-8'), salt).decode('utf-8')
+
+def check_password(password_plana, password_hash):
+    # Por seguridad, comprobamos si el hash es válido y, si no, intentamos comparación en texto plano (para retrocompatibilidad temporal)
+    try:
+        return bcrypt.checkpw(password_plana.encode('utf-8'), password_hash.encode('utf-8'))
+    except Exception:
+        return password_plana == password_hash
+
 def login():
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.markdown("### Control de Acceso")
-        with st.form("form_login"):
-            username = st.text_input("Usuario")
-            password = st.text_input("Contraseña", type="password")
-            btn_login = st.form_submit_button("Iniciar Sesión", use_container_width=True)
-            
-            if btn_login:
-                query_login = """
-                    SELECT u.username, u.rol, u.id_area_sanitaria, u.id_centro, a.nombre 
-                    FROM usuarios u
-                    LEFT JOIN areas_sanitarias a ON u.id_area_sanitaria = a.id_area
-                    WHERE u.username = ? AND u.password = ?
-                """
-                cursor = query_db(conn, DB_ENGINE, query_login, (username, password))
-                user = cursor.fetchone()
+        tab_login, tab_register = st.tabs(["🔐 Iniciar Sesión", "📝 Solicitar Acceso"])
+        
+        with tab_login:
+            st.markdown("### Control de Acceso")
+            with st.form("form_login"):
+                username = st.text_input("Usuario")
+                password = st.text_input("Contraseña", type="password")
+                btn_login = st.form_submit_button("Entrar", use_container_width=True)
                 
-                if user:
-                    st.session_state['usuario_logueado'] = user[0]
-                    st.session_state['rol'] = user[1]
-                    st.session_state['id_area'] = user[2]
-                    st.session_state['id_centro'] = user[3]
-                    st.session_state['nombre_area'] = user[4] if user[4] else "Todas / No asignada"
-                    st.success(f"Bienvenido/a, {user[0]}")
-                    st.rerun()
-                else:
-                    st.error("Usuario o contraseña incorrectos.")
+                if btn_login:
+                    if username and password:
+                        query_login = """
+                            SELECT u.username, u.password, u.rol, u.id_area_sanitaria, u.id_centro, a.nombre, u.estado 
+                            FROM usuarios u
+                            LEFT JOIN areas_sanitarias a ON u.id_area_sanitaria = a.id_area
+                            WHERE u.username = %s
+                        """ if DB_ENGINE == "postgresql" else """
+                            SELECT u.username, u.password, u.rol, u.id_area_sanitaria, u.id_centro, a.nombre, u.estado 
+                            FROM usuarios u
+                            LEFT JOIN areas_sanitarias a ON u.id_area_sanitaria = a.id_area
+                            WHERE u.username = ?
+                        """
+                        try:
+                            cursor = query_db(conn, DB_ENGINE, query_login, (username,))
+                            user = cursor.fetchone()
+                            
+                            if user:
+                                db_user, db_pass, db_rol, db_id_area, db_id_centro, db_nombre_area, db_estado = user
+                                
+                                if check_password(password, db_pass):
+                                    if db_estado == 'Aprobado':
+                                        st.session_state['usuario_logueado'] = db_user
+                                        st.session_state['rol'] = db_rol
+                                        st.session_state['id_area'] = db_id_area
+                                        st.session_state['id_centro'] = db_id_centro
+                                        st.session_state['nombre_area'] = db_nombre_area if db_nombre_area else "Todas / No asignada"
+                                        st.success(f"Bienvenido/a, {db_user}")
+                                        st.rerun()
+                                    else:
+                                        st.warning("⚠️ Tu cuenta está pendiente de ser aprobada por el administrador.")
+                                else:
+                                    st.error("❌ Contraseña incorrecta.")
+                            else:
+                                st.error("❌ El usuario no existe.")
+                        except Exception as e:
+                            st.error(f"Error al conectar: {e}")
+                    else:
+                        st.warning("Completa usuario y contraseña.")
+
+        with tab_register:
+            st.markdown("### Nueva Cuenta")
+            st.info("Al registrarte, un administrador deberá aprobar tu cuenta y asignarte tu centro.")
+            with st.form("form_registro"):
+                new_username = st.text_input("Elige un nombre de usuario")
+                new_password = st.text_input("Elige una contraseña", type="password")
+                new_password_2 = st.text_input("Repite la contraseña", type="password")
+                btn_register = st.form_submit_button("Enviar Solicitud", use_container_width=True)
+                
+                if btn_register:
+                    if new_username and new_password:
+                        if new_password == new_password_2:
+                            # Comprobar si el usuario ya existe
+                            q_check = "SELECT 1 FROM usuarios WHERE username = %s" if DB_ENGINE == "postgresql" else "SELECT 1 FROM usuarios WHERE username = ?"
+                            if query_db(conn, DB_ENGINE, q_check, (new_username,)).fetchone():
+                                st.error("Ese nombre de usuario ya está registrado.")
+                            else:
+                                hashed_pwd = hash_password(new_password)
+                                q_ins = "INSERT INTO usuarios (username, password, rol, estado) VALUES (%s, %s, %s, %s)" if DB_ENGINE == "postgresql" else "INSERT INTO usuarios (username, password, rol, estado) VALUES (?, ?, ?, ?)"
+                                try:
+                                    query_db(conn, DB_ENGINE, q_ins, (new_username, hashed_pwd, 'Pendiente', 'Pendiente'))
+                                    conn.commit()
+                                    st.success("✅ Solicitud enviada correctamente. El administrador debe aprobarla.")
+                                except Exception as e:
+                                    if hasattr(conn, 'rollback'): conn.rollback()
+                                    st.error(f"Error al registrar: {e}")
+                        else:
+                            st.error("Las contraseñas no coinciden.")
+                    else:
+                        st.warning("Rellena todos los campos.")
 
 def logout():
     for key in ['usuario_logueado', 'rol', 'id_area', 'nombre_area', 'id_centro']:
@@ -410,47 +476,59 @@ except Exception as e:
 # ==========================================
 # Si la base de datos está completamente vacía y el usuario es Admin, mostramos un formulario de emergencia
 if df_centros.empty and rol == 'Admin':
-    st.warning("⚠️ La base de datos está vacía. Debes crear la primera Área Sanitaria y el primer Centro.")
-    with st.form("form_inicializacion"):
-        st.subheader("Inicializar Base de Datos")
-        nueva_area = st.text_input("Nombre de la Primera Área Sanitaria (ej: Metropolitana Nord)")
-        nuevo_centro = st.text_input("Nombre del Primer Centro Sanitario")
-        num_cnd = st.text_input("Número de Instalación CND (opcional)")
+    # Hacemos una comprobación directa extra por si df_centros.empty es un falso positivo por un error de JOIN
+    try:
+        check_cursor = query_db(conn, DB_ENGINE, "SELECT COUNT(*) FROM centros")
+        count_centros = check_cursor.fetchone()[0]
+    except Exception:
+        count_centros = 0
         
-        if st.form_submit_button("Crear Datos Iniciales"):
-            if nueva_area and nuevo_centro:
-                try:
-                    if DB_ENGINE == 'sqlite':
+    if count_centros == 0:
+        st.warning("⚠️ La base de datos está vacía. Debes crear la primera Área Sanitaria y el primer Centro.")
+        with st.form("form_inicializacion"):
+            st.subheader("Inicializar Base de Datos")
+            nueva_area = st.text_input("Nombre de la Primera Área Sanitaria (ej: Metropolitana Nord)")
+            nuevo_centro = st.text_input("Nombre del Primer Centro Sanitario")
+            num_cnd = st.text_input("Número de Instalación CND (opcional)")
+            
+            if st.form_submit_button("Crear Datos Iniciales"):
+                if nueva_area and nuevo_centro:
+                    try:
                         cursor = conn.cursor()
-                        cursor.execute("INSERT INTO areas_sanitarias (nombre) VALUES (?)", (nueva_area,))
-                        id_area_nueva = cursor.lastrowid
-                        cursor.execute("INSERT INTO centros (nombre, n_instalacion_cnd, id_area_sanitaria) VALUES (?, ?, ?)", 
-                                       (nuevo_centro, num_cnd, id_area_nueva))
-                        conn.commit()
-                    elif DB_ENGINE == 'postgres':
-                        cursor = conn.cursor()
-                        cursor.execute("INSERT INTO areas_sanitarias (nombre) VALUES (%s) RETURNING id_area;", (nueva_area,))
-                        id_area_nueva = cursor.fetchone()[0]
-                        cursor.execute("INSERT INTO centros (nombre, n_instalacion_cnd, id_area_sanitaria) VALUES (%s, %s, %s);", 
-                                       (nuevo_centro, num_cnd, id_area_nueva))
-                        conn.commit()
-                        cursor.close()
-                    
-                    # 👇 --- LAS LÍNEAS MÁGICAS PARA BORRAR LA MEMORIA --- 👇
-                    st.cache_data.clear()
-                    st.cache_resource.clear()
-                    
-                    st.success("¡Datos inicializados correctamente! Recargando...")
-                    import time
-                    time.sleep(1) # Pequeña pausa para que veas el mensaje verde
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error al insertar los datos iniciales: {e}")
-            else:
-                st.error("Debes rellenar al menos el nombre del Área y del Centro.")
-    
-    # Detenemos la ejecución del resto de la página hasta que se inicialice
-    st.stop()
+                        
+                        if DB_ENGINE == 'sqlite':
+                            cursor.execute("INSERT INTO areas_sanitarias (nombre) VALUES (?)", (nueva_area,))
+                            id_area_nueva = cursor.lastrowid
+                            cursor.execute("INSERT INTO centros (nombre, n_instalacion_cnd, id_area_sanitaria) VALUES (?, ?, ?)", 
+                                           (nuevo_centro, num_cnd, id_area_nueva))
+                            conn.commit()
+                            
+                        elif 'postgres' in DB_ENGINE:  
+                            cursor.execute("INSERT INTO areas_sanitarias (nombre) VALUES (%s) RETURNING id_area;", (nueva_area,))
+                            id_area_nueva = cursor.fetchone()[0]
+                            cursor.execute("INSERT INTO centros (nombre, n_instalacion_cnd, id_area_sanitaria) VALUES (%s, %s, %s);", 
+                                           (nuevo_centro, num_cnd, id_area_nueva))
+                            conn.commit()
+                            cursor.close()
+                        
+                        st.cache_data.clear()
+                        st.cache_resource.clear()
+                        
+                        st.success("¡Datos inicializados en PostgreSQL correctamente! Recargando...")
+                        import time
+                        time.sleep(1)
+                        # Redirigir usando un query parameter para forzar recarga limpia
+                        st.query_params["reload"] = "true" 
+                        st.rerun()
+                    except Exception as e:
+                        if hasattr(conn, 'rollback'):
+                            conn.rollback()
+                        st.error(f"Error al insertar los datos iniciales: {e}")
+                else:
+                    st.error("Debes rellenar al menos el nombre del Área y del Centro.")
+        
+        # Detenemos la ejecución del resto de la página hasta que se inicialice
+        st.stop()
 
 
 # ==========================================
@@ -490,18 +568,17 @@ st.divider()
 # ==========================================
 # DEFINICIÓN DE PESTAÑAS
 # ==========================================
-if rol in ['Admin', 'Coordinador']:
+if rol == 'Admin':
+    tab_listado, tab_gestion, tab_centros, tab_lecturas, tab_usuarios = st.tabs([
+        "📋 Listado", "⚙️ Altas/Bajas", "🏢 Centros", "📄 Lecturas", "👤 Usuarios"
+    ])
+elif rol == 'Coordinador':
     tab_listado, tab_gestion, tab_centros, tab_lecturas = st.tabs([
-        "📋 Listado del Centro", 
-        "⚙️ Altas y Bajas", 
-        "🏢 Gestión de Centros", 
-        "📄 Lecturas dosimétricas"
+        "📋 Listado", "⚙️ Altas/Bajas", "🏢 Centros", "📄 Lecturas"
     ])
 else:
     tab_listado, tab_gestion, tab_lecturas = st.tabs([
-        "📋 Listado del Centro", 
-        "⚙️ Altas y Bajas", 
-        "📄 Lecturas dosimétricas"
+        "📋 Listado", "⚙️ Altas/Bajas", "📄 Lecturas"
     ])
 
 # ==============================================================================
@@ -808,21 +885,21 @@ with tab_gestion:
 
         st.divider()
 
-        # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
         # 4. RESUMEN DE ASIGNACIONES ACTIVAS
         # ----------------------------------------------------------------------
         st.subheader(f"📋 Resumen de Asignaciones Activas en {centro_seleccionado}")
         query_resumen = """
             SELECT 
-                ad.id_asignacion AS 'ID Asig.',
-                t.id_trabajador AS 'ID Trab.',
-                t.nombre AS 'Trabajador',
-                d.id_dosimetro AS 'ID Dosi.',
-                d.codigo_serie AS 'Código Dosímetro',
-                d.ubicacion AS 'Ubicación / Sala',
-                d.n_usuario_cnd AS 'Usuario CND',
-                d.n_instalacion_cnd AS 'Instalación CND',
-                COALESCE(CAST(ad.fecha_asignacion AS VARCHAR), '-') AS 'Fecha Asignación'
+                ad.id_asignacion AS "ID Asig.",
+                t.id_trabajador AS "ID Trab.",
+                t.nombre AS "Trabajador",
+                d.id_dosimetro AS "ID Dosi.",
+                d.codigo_serie AS "Código Dosímetro",
+                d.ubicacion AS "Ubicación / Sala",
+                d.n_usuario_cnd AS "Usuario CND",
+                d.n_instalacion_cnd AS "Instalación CND",
+                COALESCE(CAST(ad.fecha_asignacion AS VARCHAR), '-') AS "Fecha Asignación"
             FROM asignaciones_dosimetros ad
             JOIN trabajadores t ON ad.id_trabajador = t.id_trabajador
             JOIN dosimetros d ON ad.id_dosimetro = d.id_dosimetro
@@ -947,5 +1024,81 @@ with tab_lecturas:
                     st.info(f"No hay lecturas registradas para la instalación CND {n_inst_sel}.")
             except Exception as e:
                 st.error(f"Error al cargar histórico: {e}")
+
+
+# ==============================================================================
+# PESTAÑA 5: APROBACIÓN Y GESTIÓN DE USUARIOS (SOLO ADMIN)
+# ==============================================================================
+if rol == 'Admin':
+    with tab_usuarios:
+        st.header("👤 Gestión de Accesos y Aprobaciones")
+        
+        try:
+            # Usuarios pendientes
+            st.subheader("🔔 Solicitudes Pendientes")
+            df_pend = read_sql_db("SELECT id_usuario, username, estado FROM usuarios WHERE estado = 'Pendiente'", conn, DB_ENGINE)
+            
+            if not df_pend.empty:
+                df_areas = read_sql_db("SELECT id_area, nombre FROM areas_sanitarias ORDER BY nombre", conn, DB_ENGINE)
+                df_cens = read_sql_db("SELECT id_centro, nombre, id_area_sanitaria FROM centros ORDER BY nombre", conn, DB_ENGINE)
+                
+                for _, row in df_pend.iterrows():
+                    with st.expander(f"Solicitud: {row['username']}"):
+                        with st.form(f"form_aprob_{row['id_usuario']}"):
+                            col_rol, col_area, col_cen = st.columns(3)
+                            
+                            with col_rol:
+                                sel_rol = st.selectbox("Rol a asignar", ["Centro", "Coordinador", "Admin"])
+                            with col_area:
+                                sel_area = st.selectbox("Área (Para Coordinador o Centro)", ["Ninguna"] + df_areas['nombre'].tolist())
+                            with col_cen:
+                                # Filtramos centros si se elige un área
+                                if sel_area != "Ninguna":
+                                    id_ar = df_areas[df_areas['nombre'] == sel_area]['id_area'].values[0]
+                                    centros_filtrados = df_cens[df_cens['id_area_sanitaria'] == id_ar]['nombre'].tolist()
+                                else:
+                                    centros_filtrados = ["Ninguno"]
+                                sel_cen = st.selectbox("Centro", ["Ninguno"] + centros_filtrados)
+                            
+                            col_btn1, col_btn2 = st.columns([1, 4])
+                            with col_btn1:
+                                if st.form_submit_button("✅ Aprobar"):
+                                    id_ar_val = df_areas[df_areas['nombre'] == sel_area]['id_area'].values[0] if sel_area != "Ninguna" else None
+                                    id_cen_val = df_cens[df_cens['nombre'] == sel_cen]['id_centro'].values[0] if sel_cen != "Ninguno" else None
+                                    
+                                    q_upd = "UPDATE usuarios SET rol=%s, id_area_sanitaria=%s, id_centro=%s, estado='Aprobado' WHERE id_usuario=%s" if DB_ENGINE == "postgresql" else "UPDATE usuarios SET rol=?, id_area_sanitaria=?, id_centro=?, estado='Aprobado' WHERE id_usuario=?"
+                                    query_db(conn, DB_ENGINE, q_upd, (sel_rol, id_ar_val, id_cen_val, row['id_usuario']))
+                                    conn.commit()
+                                    st.cache_data.clear()
+                                    st.success(f"Usuario {row['username']} aprobado.")
+                                    st.rerun()
+                            with col_btn2:
+                                if st.form_submit_button("🗑️ Rechazar y Eliminar"):
+                                    q_del = "DELETE FROM usuarios WHERE id_usuario=%s" if DB_ENGINE == "postgresql" else "DELETE FROM usuarios WHERE id_usuario=?"
+                                    query_db(conn, DB_ENGINE, q_del, (row['id_usuario'],))
+                                    conn.commit()
+                                    st.cache_data.clear()
+                                    st.success("Solicitud rechazada.")
+                                    st.rerun()
+            else:
+                st.info("No hay solicitudes de acceso pendientes.")
+                
+            st.divider()
+            
+            # Usuarios activos
+            st.subheader("👥 Usuarios Activos")
+            query_activos = """
+                SELECT u.id_usuario, u.username, u.rol, COALESCE(a.nombre, '-') as area, COALESCE(c.nombre, '-') as centro 
+                FROM usuarios u 
+                LEFT JOIN areas_sanitarias a ON u.id_area_sanitaria = a.id_area 
+                LEFT JOIN centros c ON u.id_centro = c.id_centro 
+                WHERE u.estado = 'Aprobado'
+            """
+            df_activos = read_sql_db(query_activos, conn, DB_ENGINE)
+            if not df_activos.empty:
+                st.dataframe(df_activos, use_container_width=True, hide_index=True)
+                
+        except Exception as e:
+            st.error(f"Error en panel de usuarios: {e}")
 
 conn.close()
