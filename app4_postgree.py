@@ -250,7 +250,7 @@ def login():
                 if btn_login:
                     if username and password:
                         query_login = """
-                            SELECT u.username, u.password, u.rol, u.id_area_sanitaria, u.id_centro, a.nombre, u.estado 
+                            SELECT u.username, u.password, u.rol, u.id_area_sanitaria, u.id_centro, a.nombre, u.estado, u.id_trabajador
                             FROM usuarios u
                             LEFT JOIN areas_sanitarias a ON u.id_area_sanitaria = a.id_area
                             WHERE u.username = %s
@@ -265,7 +265,7 @@ def login():
                             user = cursor.fetchone()
                             
                             if user:
-                                db_user, db_pass, db_rol, db_id_area, db_id_centro, db_nombre_area, db_estado = user
+                                db_user, db_pass, db_rol, db_id_area, db_id_centro, db_nombre_area, db_estado, db_id_trabajador = user
                                 
                                 if check_password(password, db_pass):
                                     if db_estado == 'Aprobado':
@@ -274,6 +274,7 @@ def login():
                                         st.session_state['id_area'] = db_id_area
                                         st.session_state['id_centro'] = db_id_centro
                                         st.session_state['nombre_area'] = db_nombre_area if db_nombre_area else "Todas / No asignada"
+                                        st.session_state['id_trabajador'] = db_id_trabajador
                                         st.success(f"Bienvenido/a, {db_user}")
                                         st.rerun()
                                     else:
@@ -569,17 +570,89 @@ st.divider()
 # DEFINICIÓN DE PESTAÑAS
 # ==========================================
 if rol == 'Admin':
-    tab_listado, tab_gestion, tab_centros, tab_lecturas, tab_usuarios = st.tabs([
-        "📋 Listado", "⚙️ Altas/Bajas", "🏢 Centros", "📄 Lecturas", "👤 Usuarios"
+    tab_personal, tab_listado, tab_gestion, tab_centros, tab_lecturas, tab_usuarios = st.tabs([
+        "👤 Mi Dosimetría", "📋 Listado", "⚙️ Altas/Bajas", "🏢 Centros", "📄 Lecturas", "👥 Usuarios"
     ])
 elif rol == 'Coordinador':
-    tab_listado, tab_gestion, tab_centros, tab_lecturas = st.tabs([
-        "📋 Listado", "⚙️ Altas/Bajas", "🏢 Centros", "📄 Lecturas"
+    tab_personal, tab_listado, tab_gestion, tab_centros, tab_lecturas = st.tabs([
+        "👤 Mi Dosimetría", "📋 Listado", "⚙️ Altas/Bajas", "🏢 Centros", "📄 Lecturas"
     ])
 else:
-    tab_listado, tab_gestion, tab_lecturas = st.tabs([
-        "📋 Listado", "⚙️ Altas/Bajas", "📄 Lecturas"
+    tab_personal, tab_listado, tab_gestion, tab_lecturas = st.tabs([
+        "👤 Mi Dosimetría", "📋 Listado del Centro", "⚙️ Altas y Bajas", "📄 Lecturas"
     ])
+
+
+# ==============================================================================
+# PESTAÑA PERSONAL: MI HISTORIAL DOSIMÉTRICO
+# ==============================================================================
+with tab_personal:
+    st.header(f"👤 Mi Historial Dosimétrico — {st.session_state.get('usuario_logueado')}")
+    
+    id_trab_sesion = st.session_state.get('id_trabajador')
+    
+    if not id_trab_sesion:
+        st.info("ℹ️ Tu usuario no está vinculado actualmente a ninguna ficha de trabajador o dosimetría personal.")
+    else:
+        # 1. Consultar dosímetros asignados actualmente al trabajador
+        q_mis_dosimetros = """
+            SELECT d.id_dosimetro, d.codigo_serie, d.ubicacion, d.n_usuario_cnd, d.n_instalacion_cnd, ad.fecha_asignacion
+            FROM asignaciones_dosimetros ad
+            JOIN dosimetros d ON ad.id_dosimetro = d.id_dosimetro
+            WHERE ad.id_trabajador = ? AND ad.activo = 1
+        """
+        df_mis_dosi = read_sql_db(q_mis_dosimetros, conn, DB_ENGINE, params=(id_trab_sesion,))
+        
+        # 2. Consultar lecturas históricas de todos sus dosímetros
+        q_mis_lecturas = """
+            SELECT 
+                l.anio AS "Año",
+                l.mes AS "Mes",
+                d.codigo_serie AS "Dosímetro",
+                COALESCE(d.ubicacion, 'Personal') AS "Ubicación / Área",
+                l.hp10_asignada AS "Hp(10) [mSv]",
+                l.hp007_asignada AS "Hp(0,07) [mSv]"
+            FROM asignaciones_dosimetros ad
+            JOIN dosimetros d ON ad.id_dosimetro = d.id_dosimetro
+            JOIN lecturas l ON d.n_usuario_cnd = l.n_usuario_cnd AND d.n_instalacion_cnd = l.n_instalacion_cnd
+            WHERE ad.id_trabajador = ?
+            ORDER BY l.anio DESC, l.id DESC
+        """
+        df_mis_lecturas = read_sql_db(q_mis_lecturas, conn, DB_ENGINE, params=(id_trab_sesion,))
+        
+        # --- CASO A: El trabajador NO tiene dosímetros asignados ---
+        if df_mis_dosi.empty:
+            st.warning("⚠️ No tienes ningún dosímetro asignado activamente en este momento.")
+            
+        # --- CASO B: Tiene uno o más dosímetros asignados ---
+        else:
+            col_d1, col_d2, col_d3 = st.columns(3)
+            with col_d1:
+                st.metric("Dosímetros Activos Asignados", len(df_mis_dosi))
+            with col_d2:
+                total_hp10 = df_mis_lecturas["Hp(10) [mSv]"].sum() if not df_mis_lecturas.empty else 0.0
+                st.metric("Dosis Acumulada Hp(10)", f"{total_hp10:.2f} mSv")
+            with col_d3:
+                total_hp007 = df_mis_lecturas["Hp(0,07) [mSv]"].sum() if not df_mis_lecturas.empty else 0.0
+                st.metric("Dosis Acumulada Hp(0,07)", f"{total_hp007:.2f} mSv")
+            
+            st.divider()
+            
+            # Listado de dosímetros asignados actualmente
+            st.subheader("📟 Mis Dosímetros Asignados")
+            df_mostrar_dosi = df_mis_dosi[['codigo_serie', 'ubicacion', 'n_usuario_cnd', 'fecha_asignacion']].copy()
+            df_mostrar_dosi.columns = ["Código Serie", "Ubicación / Puesto", "Usuario CND", "Fecha Asignación"]
+            st.dataframe(df_mostrar_dosi, use_container_width=True, hide_index=True)
+            
+            st.divider()
+            
+            # Tabla de lecturas históricas
+            st.subheader("📊 Lecturas Históricas Registradas")
+            if not df_mis_lecturas.empty:
+                st.dataframe(df_mis_lecturas, use_container_width=True, hide_index=True)
+            else:
+                st.info("ℹ️ Tienes dosímetros asignados, pero aún no se han importado lecturas dosimétricas para tus equipos.")
+
 
 # ==============================================================================
 # PESTAÑA 1: LISTADO Y DOSIS ASIGNADA
@@ -1042,13 +1115,33 @@ if rol == 'Admin':
                 df_areas = read_sql_db("SELECT id_area, nombre FROM areas_sanitarias ORDER BY nombre ASC", conn, DB_ENGINE)
                 df_cens = read_sql_db("SELECT id_centro, nombre, id_area_sanitaria FROM centros ORDER BY nombre ASC", conn, DB_ENGINE)
                 
+                # Cargamos los trabajadores activos para poder vincular la cuenta a su ficha
+                query_trab_todos = """
+                    SELECT t.id_trabajador, t.nombre, c.nombre AS centro
+                    FROM trabajadores t
+                    LEFT JOIN centros c ON t.id_centro = c.id_centro
+                    WHERE t.activo = 1
+                    ORDER BY t.nombre ASC
+                """
+                df_trab_todos = read_sql_db(query_trab_todos, conn, DB_ENGINE)
+                
                 lista_nombres_areas = df_areas['nombre'].tolist() if not df_areas.empty else []
                 lista_nombres_centros = df_cens['nombre'].tolist() if not df_cens.empty else []
+                
+                # Generamos la lista de trabajadores con formato "ID - Nombre (Centro)"
+                opciones_trabajadores = ["Ninguno / No vincular"]
+                if not df_trab_todos.empty:
+                    df_trab_todos['selector'] = (
+                        df_trab_todos['id_trabajador'].astype(str) + " - " + 
+                        df_trab_todos['nombre'] + " (" + 
+                        df_trab_todos['centro'].fillna('Sin centro') + ")"
+                    )
+                    opciones_trabajadores += df_trab_todos['selector'].tolist()
                 
                 for _, row in df_pend.iterrows():
                     with st.expander(f"Solicitud: {row['username']}", expanded=True):
                         with st.form(f"form_aprob_{row['id_usuario']}"):
-                            col_rol, col_area, col_cen = st.columns(3)
+                            col_rol, col_area, col_cen, col_trab = st.columns(4)
                             
                             with col_rol:
                                 sel_rol = st.selectbox(
@@ -1068,12 +1161,23 @@ if rol == 'Admin':
                                     ["Ninguno"] + lista_nombres_centros,
                                     key=f"cen_{row['id_usuario']}"
                                 )
+                            with col_trab:
+                                sel_trab = st.selectbox(
+                                    "Vincular Trabajador (para su historial)", 
+                                    opciones_trabajadores,
+                                    key=f"trab_{row['id_usuario']}"
+                                )
                             
                             col_btn1, col_btn2 = st.columns([1, 4])
                             with col_btn1:
                                 if st.form_submit_button("✅ Aprobar"):
                                     id_ar_val = None
                                     id_cen_val = None
+                                    id_trab_val = None
+                                    
+                                    # Extraer ID de trabajador si se ha seleccionado uno
+                                    if sel_trab != "Ninguno / No vincular":
+                                        id_trab_val = int(sel_trab.split(" - ")[0])
                                     
                                     if sel_rol == "Coordinador":
                                         if sel_area != "Ninguna" and not df_areas.empty:
@@ -1082,20 +1186,19 @@ if rol == 'Admin':
                                         if sel_cen != "Ninguno" and not df_cens.empty:
                                             fila_cen = df_cens[df_cens['nombre'] == sel_cen].iloc[0]
                                             id_cen_val = int(fila_cen['id_centro'])
-                                            # Asignar automáticamente el área vinculada a este centro
                                             if pd.notnull(fila_cen['id_area_sanitaria']):
                                                 id_ar_val = int(fila_cen['id_area_sanitaria'])
                                     
                                     q_upd = """
                                         UPDATE usuarios 
-                                        SET rol=%s, id_area_sanitaria=%s, id_centro=%s, estado='Aprobado' 
+                                        SET rol=%s, id_area_sanitaria=%s, id_centro=%s, id_trabajador=%s, estado='Aprobado' 
                                         WHERE id_usuario=%s
                                     """ if DB_ENGINE == "postgresql" else """
                                         UPDATE usuarios 
-                                        SET rol=?, id_area_sanitaria=?, id_centro=?, estado='Aprobado' 
+                                        SET rol=?, id_area_sanitaria=?, id_centro=?, id_trabajador=?, estado='Aprobado' 
                                         WHERE id_usuario=?
                                     """
-                                    query_db(conn, DB_ENGINE, q_upd, (sel_rol, id_ar_val, id_cen_val, row['id_usuario']))
+                                    query_db(conn, DB_ENGINE, q_upd, (sel_rol, id_ar_val, id_cen_val, id_trab_val, row['id_usuario']))
                                     conn.commit()
                                     st.cache_data.clear()
                                     st.success(f"✔ Usuario '{row['username']}' aprobado con rol {sel_rol}.")
@@ -1117,11 +1220,17 @@ if rol == 'Admin':
             # 2. Listado de usuarios activos
             st.subheader("👥 Usuarios Activos")
             query_activos = """
-                SELECT u.id_usuario AS "ID", u.username AS "Usuario", u.rol AS "Rol", 
-                       COALESCE(a.nombre, '-') AS "Área", COALESCE(c.nombre, '-') AS "Centro"
+                SELECT 
+                    u.id_usuario AS "ID", 
+                    u.username AS "Usuario", 
+                    u.rol AS "Rol", 
+                    COALESCE(a.nombre, '-') AS "Área", 
+                    COALESCE(c.nombre, '-') AS "Centro",
+                    COALESCE(t.nombre, 'Sin vincular') AS "Trabajador Vinculado"
                 FROM usuarios u 
                 LEFT JOIN areas_sanitarias a ON u.id_area_sanitaria = a.id_area 
                 LEFT JOIN centros c ON u.id_centro = c.id_centro 
+                LEFT JOIN trabajadores t ON u.id_trabajador = t.id_trabajador
                 WHERE u.estado = 'Aprobado'
                 ORDER BY u.id_usuario ASC
             """
